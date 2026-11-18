@@ -1,0 +1,12 @@
+Project Atlas - Q2 planning meeting
+Attendees: Leo, Ana, Tom, Priya
+
+Decisions:
+- Migrate the reporting service to the new data pipeline by June 30.
+- Tom owns the API deprecation plan; draft due next sprint.
+- Hiring: open one backend engineer position.
+
+Action items:
+[ ] Leo  - write migration design doc
+[ ] Priya - estimate infra costs
+[ ] Ana  - schedule stakeholder review

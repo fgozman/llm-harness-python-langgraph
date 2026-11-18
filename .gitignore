@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Demo scratch copy (recreate with: uv run python demo/demo.py reset)
+demo/inbox/
+
+# Session logs (see --log-file)
+*.log
+
+# Saved agent state for resuming (see --state-db)
+.file-organizer.sqlite*

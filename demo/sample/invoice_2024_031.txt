@@ -1,0 +1,13 @@
+ACME Web Hosting Ltd.
+INVOICE #2024-031
+Date: 2024-03-01        Due: 2024-03-31
+
+Bill to: Leo Gozman
+
+  Shared hosting plan (12 months) ........ 96.00 EUR
+  Domain renewal (example.org) ........... 14.50 EUR
+  VAT 19% ................................ 21.00 EUR
+  ------------------------------------------------
+  TOTAL DUE .............................. 131.50 EUR
+
+Pay by bank transfer to IBAN DE00 1234 5678 9012 3456 78.

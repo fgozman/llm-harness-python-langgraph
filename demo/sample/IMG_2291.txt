@@ -1,0 +1,5 @@
+BOARDING PASS
+Passenger: GOZMAN/LEO
+Flight: TP 573   From: BERLIN (BER)   To: LISBON (LIS)
+Date: 10 MAY 2024   Boarding: 08:15   Gate: B12   Seat: 14C
+Group 3 - Gate closes 20 minutes before departure.

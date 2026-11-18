@@ -1,0 +1,14 @@
+From: reservations@hotel-alfama.example
+To: leo@example.com
+Subject: Your booking is confirmed - Hotel Alfama, Lisbon
+
+Dear Leo,
+
+Thank you for your reservation.
+
+  Confirmation no.: HA-88213
+  Check-in:  Fri 10 May 2024, from 15:00
+  Check-out: Mon 13 May 2024, by 11:00
+  Room: Double, city view, breakfast included
+
+We look forward to welcoming you to Lisbon.

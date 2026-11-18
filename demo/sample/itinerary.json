@@ -1,0 +1,9 @@
+{
+  "trip": "Portugal, May 2024",
+  "days": [
+    {"date": "2024-05-10", "city": "Lisbon", "plan": ["Arrive", "Alfama walk", "Fado dinner"]},
+    {"date": "2024-05-11", "city": "Sintra", "plan": ["Pena Palace", "Quinta da Regaleira"]},
+    {"date": "2024-05-12", "city": "Lisbon", "plan": ["Belem tower", "Pasteis de Belem"]},
+    {"date": "2024-05-13", "city": "Lisbon", "plan": ["Flight home TP 574"]}
+  ]
+}

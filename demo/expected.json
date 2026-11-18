@@ -1,0 +1,17 @@
+{
+  "_comment": "Acceptable final location (category dir) per file, relative to the inbox. null = left in place (top level). Arrays list all acceptable answers.",
+  "invoice_2024_031.txt": "finance",
+  "bank_statement_march.csv": "finance",
+  "tax_return_2023.txt": ["finance", "taxes", "tax", "legal"],
+  "finance/receipt_laptop.txt": "finance",
+  "notes.txt": ["health", "medical"],
+  "lab_results.md": ["health", "medical"],
+  "booking_confirmation.eml": "travel",
+  "IMG_2291.txt": "travel",
+  "itinerary.json": "travel",
+  "vacation_photo.png": [null, "travel", "photos", "personal", "images"],
+  "meeting_minutes_q2.txt": "work",
+  "scan_001.txt": ["legal", "housing", "home"],
+  "course_certificate.txt": ["education", "certificates"],
+  "todo.txt": [null, "personal"]
+}
