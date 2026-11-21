@@ -1,0 +1,40 @@
+# Local Arize Phoenix for tracing the agent (LLM calls, tool calls, graph steps).
+# Run from the project root:
+#
+#   docker compose -f docker/phoenix/compose.yaml up -d      # start it in the background
+#   open http://localhost:6006                               # the Phoenix UI
+#   uv sync --extra phoenix
+#   uv run file-organizer demo/inbox --phoenix
+#   docker compose -f docker/phoenix/compose.yaml down       # stop (traces are kept)
+#   docker compose -f docker/phoenix/compose.yaml down -v    # stop and delete all traces
+
+# Fixed project name, so the container/volume names don't depend on this folder's name
+# and the commands work from any directory.
+name: file-organizer-phoenix
+
+services:
+  phoenix:
+    # Pinned for reproducibility; see https://hub.docker.com/r/arizephoenix/phoenix/tags
+    image: arizephoenix/phoenix:version-22.0.0
+    container_name: file-organizer-phoenix
+    restart: unless-stopped
+    ports:
+      # Bound to 127.0.0.1 only: traces contain prompts and file contents, so the UI
+      # and collectors are not exposed to the network.
+      - "127.0.0.1:6006:6006"  # UI + OTLP/HTTP collector (http://localhost:6006/v1/traces)
+      - "127.0.0.1:4317:4317"  # OTLP/gRPC collector
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data  # SQLite database lives here (persisted below)
+      PHOENIX_TELEMETRY_ENABLED: "false"  # no usage telemetry from the local instance
+      # Phoenix 22+ enables login + API keys by default, and rejects unauthenticated
+      # traces (HTTP 401). This instance is reachable from this machine only, so auth is
+      # off. To turn it on: set PHOENIX_ENABLE_AUTH=true and PHOENIX_SECRET (32+ chars),
+      # log in as admin@localhost / admin, create a system API key under Settings,
+      # and put PHOENIX_API_KEY=<key> in the project's .env.
+      PHOENIX_ENABLE_AUTH: "false"
+    volumes:
+      - phoenix_data:/mnt/data
+
+volumes:
+  phoenix_data:
+    name: file-organizer-phoenix-data

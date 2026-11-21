@@ -36,6 +36,13 @@ from .memory import ContextPolicy, DecisionLog
 from .persistence import DEFAULT_STATE_DB, sqlite_checkpointer, sqlite_store
 from .prompts import START_MESSAGE
 from .tools import MUTATING_TOOLS
+from .tracing import (
+    DEFAULT_PHOENIX_ENDPOINT,
+    DEFAULT_PHOENIX_PROJECT,
+    TracingUnavailable,
+    configure_tracing,
+    trace_session,
+)
 from .usage import TokenUsage
 from .workspace import Workspace, WorkspaceError
 
@@ -192,7 +199,15 @@ def run(
     try:
         # LangGraph's SQLite checkpointer (graph state per thread_id) and store (finalized
         # decisions, with a TTL), both in the state_db file.
-        with sqlite_checkpointer(state_db) as checkpointer, sqlite_store(state_db) as store:
+        # trace_session: if tracing to Phoenix is on, this whole session (the start and
+        # every resume after an approval) is one trace, under one root span.
+        with (
+            trace_session(thread_id, input=f"Organize {workspace.root}",
+                          metadata={"run_id": session_id.get(),
+                                    "folder": str(workspace.root)}) as trace,
+            sqlite_checkpointer(state_db) as checkpointer,
+            sqlite_store(state_db) as store,
+        ):
             graph = build_graph(model, workspace, checkpointer=checkpointer, store=store,
                                 summary_model=summary_model, policy=policy)
 
@@ -209,17 +224,22 @@ def run(
             if saved.next and confirm("Resume the interrupted session for this folder?", input_fn):
                 log.info("Resuming the interrupted session (stopped before: %s)", saved.next)
                 graph_input = None  # None = continue from the last saved step
+                run_name = "resume after restart"
                 pending = saved.interrupts[0] if saved.interrupts else None
                 usage = SessionUsage.from_state(saved.values)
             else:  # start over with a clean state
                 checkpointer.prune([thread_id], strategy="delete")
                 DecisionLog(store, thread_id).clear()
+                run_name = "organize"
 
             while True:
                 if pending is not None:
                     # Answer exactly this question (by interrupt id), so an old answer can
                     # never be applied to a different question after a restart.
                     decision = ask_approval(pending.value, input_fn, output_fn)
+                    trace.decision(pending.value, decision)
+                    answer = "approved" if decision["approved"] else "rejected"
+                    run_name = f"resume: {answer} {pending.value['description']}"[:120]
                     # A dict keyed by interrupt ids is a "resume map"; a plain value
                     # (Command(resume=decision)) would answer whichever one is pending.
                     graph_input = Command(resume={pending.id: decision})
@@ -231,7 +251,10 @@ def run(
                 # durability="sync" writes each checkpoint before the next step starts,
                 # so nothing is lost if the process dies (default "async" writes in the
                 # background; "exit" only when the run ends).
-                for step in graph.stream(graph_input, config, stream_mode="updates", durability="sync"):
+                # run_name: the name of this graph run's span in tracing tools (Phoenix).
+                run_config = {**config, "run_name": run_name}
+                for step in graph.stream(graph_input, run_config, stream_mode="updates",
+                                         durability="sync"):
                     for node, update in step.items():
                         if node == "__interrupt__":  # paused by interrupt() in the review node
                             # update is a tuple of Interrupt objects; the review node
@@ -245,6 +268,8 @@ def run(
                     # (and its writes), so drop the older ones to keep the file small.
                     checkpointer.prune([thread_id], strategy="keep_latest")
                 else:  # finished without pausing: the agent is done
+                    messages = graph.get_state(config).values.get("messages", [])
+                    trace.finish(messages[-1].text if messages else "")
                     checkpointer.prune([thread_id], strategy="delete")  # nothing left to resume
                     _report_usage(usage, output_fn)
                     log.info("Session finished")
@@ -264,6 +289,11 @@ def run(
         return 1
     finally:
         session_id.reset(session_token)
+
+
+def _env_flag(name: str) -> bool:
+    """True for an environment variable set to 1/true/yes/on (case-insensitive)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _positive_int(value: str) -> int:
@@ -343,6 +373,27 @@ def main(
         help="SQLite file where progress is saved for resuming "
         "(default: $FILE_ORGANIZER_STATE_DB or %(default)s)",
     )
+    parser.add_argument(
+        "--phoenix",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("FILE_ORGANIZER_PHOENIX"),
+        help="trace the agent (LLM calls, tools, graph steps) to Arize Phoenix; needs "
+        "'uv sync --extra phoenix' and a running Phoenix "
+        "(docker compose -f docker/phoenix/compose.yaml up -d) "
+        "(default: $FILE_ORGANIZER_PHOENIX or off)",
+    )
+    parser.add_argument(
+        "--phoenix-endpoint",
+        default=os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", DEFAULT_PHOENIX_ENDPOINT),
+        metavar="URL",
+        help="Phoenix base URL (default: $PHOENIX_COLLECTOR_ENDPOINT or %(default)s)",
+    )
+    parser.add_argument(
+        "--phoenix-project",
+        default=os.environ.get("PHOENIX_PROJECT_NAME", DEFAULT_PHOENIX_PROJECT),
+        metavar="NAME",
+        help="Phoenix project for the traces (default: $PHOENIX_PROJECT_NAME or %(default)s)",
+    )
     args = parser.parse_args(argv)
     try:  # check that the context limits fit together before doing anything
         policy = ContextPolicy(summarize_at_tokens=args.summarize_at, max_input_tokens=args.max_context_tokens)
@@ -350,7 +401,19 @@ def main(
         parser.error(str(exc))  # exits with code 2
 
     stop_logging = configure_logging(args.log_file, args.log_level, args.log_format)
+    stop_tracing: Callable[[], None] | None = None
     try:
+        if args.phoenix:
+            try:
+                stop_tracing = configure_tracing(args.phoenix_endpoint, args.phoenix_project)
+            except TracingUnavailable as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            except Exception as exc:  # e.g. a malformed endpoint URL
+                log.exception("Could not set up Phoenix tracing")
+                print(f"error: could not set up Phoenix tracing: {exc}", file=sys.stderr)
+                return 2
+            print(f"Tracing to Phoenix: {args.phoenix_endpoint} (project {args.phoenix_project!r})")
         Workspace(args.folder)  # validate before spending anything on a model
         model_name = args.model
         model = model_factory(model_name)  # e.g. init_chat_model("anthropic:claude-...")
@@ -367,6 +430,11 @@ def main(
         print(f"error: could not create model '{model_name}': {exc}", file=sys.stderr)
         return 2
     finally:
+        if stop_tracing is not None:
+            try:
+                stop_tracing()  # send spans still buffered to Phoenix
+            except Exception:  # Phoenix down: never fail the session over its traces
+                log.warning("Could not flush traces to Phoenix", exc_info=True)
         stop_logging()  # flush queued log records before exiting
 
 

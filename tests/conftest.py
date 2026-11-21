@@ -70,8 +70,9 @@ class ScriptedChatModel(BaseChatModel):
 
 @pytest.fixture(autouse=True)
 def _isolated_cwd(tmp_path_factory, monkeypatch):
-    """Keep the developer's real .env out of the tests."""
+    """Keep the developer's real .env (and tracing settings) out of the tests."""
     monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+    monkeypatch.delenv("FILE_ORGANIZER_PHOENIX", raising=False)
 
 
 @pytest.fixture(autouse=True)

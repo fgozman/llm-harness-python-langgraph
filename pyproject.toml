@@ -25,6 +25,10 @@ anthropic = [
 openai = [
     "langchain-openai>=1.8.0",
 ]
+phoenix = [
+    "arize-phoenix-otel>=0.17.3",
+    "openinference-instrumentation-langchain>=0.1.89",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]

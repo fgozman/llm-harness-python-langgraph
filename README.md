@@ -106,6 +106,58 @@ For each proposed change you can answer `y`, answer `n`, or type feedback. Feedb
 rejects the change and is passed to the model. Ctrl-C aborts the run, and nothing
 else is changed.
 
+### Tracing with Arize Phoenix
+
+The log records what happened. [Arize Phoenix](https://arize.com/docs/phoenix) adds a UI
+where you can see **how** it happened. One session is **one trace**, even though the graph
+pauses for every approval:
+
+```
+file-organizer                                    root span: input folder, output = final message,
+├─ organize                                       events = each human decision
+│  ├─ summarize, agent (LLM call), review, tools (read_file, ...) ...
+├─ resume: approved Create directory 'finance'    one graph run per answer
+├─ resume: rejected Move 'a.txt' -> 'finance'
+└─ ...
+```
+
+Every pause for a human answer ends a `graph.stream()` call and the answer starts a new
+one. The instrumentation would report each call as a separate trace, so the CLI wraps the
+session in a root span (`tracing.trace_session`) and the graph runs nest under it. The
+node spans contain the LLM calls (full prompt, response, tool calls, tokens, latency) and
+the tool calls (arguments and results). If the session is aborted, the root span says so;
+if it fails, the root span has error status and the exception. Tracing uses OpenTelemetry
+through the OpenInference LangChain instrumentor, which also covers LangGraph. It is
+optional and off by default.
+
+Phoenix runs locally in Docker (`docker/phoenix/compose.yaml`):
+
+```bash
+docker compose -f docker/phoenix/compose.yaml up -d   # Phoenix 22, traces kept in a Docker volume
+uv sync --extra anthropic --extra phoenix
+uv run file-organizer demo/inbox --phoenix
+open http://localhost:6006            # project "file-organizer"
+docker compose -f docker/phoenix/compose.yaml down    # stop (add -v to delete all traces)
+```
+
+- **Sessions:** every span of a folder's session has the session id
+  `organize:<absolute folder path>`. A session resumed in a later process (after Ctrl-C
+  or a crash) is a new trace (its first graph run is `resume after restart`), and both
+  traces appear together in Phoenix's *Sessions* tab. The metadata `run_id` matches the `session_id` in the log file.
+- **Settings:** `--phoenix` / `--no-phoenix` (`FILE_ORGANIZER_PHOENIX=true`),
+  `--phoenix-endpoint` (`PHOENIX_COLLECTOR_ENDPOINT`, default `http://localhost:6006`), and
+  `--phoenix-project` (`PHOENIX_PROJECT_NAME`, default `file-organizer`).
+- **Never in the way:** spans are exported in a background thread. If Phoenix is down,
+  spans are dropped and the session goes on. Remaining spans are flushed at exit.
+- **Privacy:** unlike the log, traces contain prompts and therefore **file contents**.
+  The container publishes its ports on `127.0.0.1` only, and Phoenix's own telemetry is
+  off. To keep content out of the traces, set `OPENINFERENCE_HIDE_INPUTS`,
+  `OPENINFERENCE_HIDE_OUTPUTS`, `OPENINFERENCE_HIDE_INPUT_MESSAGES`, and
+  `OPENINFERENCE_HIDE_OUTPUT_MESSAGES` to `true` (see `.env.example`).
+- **Auth:** Phoenix 22 turns on login by default and rejects traces without an API key
+  (HTTP 401). The local container sets `PHOENIX_ENABLE_AUTH=false`. If you turn auth on
+  (see the comments in `docker/phoenix/compose.yaml`), put `PHOENIX_API_KEY=<key>` in `.env`.
+
 ### Resuming an interrupted session
 
 LangGraph saves the agent's state to a SQLite file (`.file-organizer.sqlite` in the
@@ -224,6 +276,7 @@ START → summarize → agent ──(no tool calls)──▶ END
 | `usage.py` | `TokenUsage` totals, the `add_usage` state reducer, and `collect_usage()` (counts LLM calls made inside library code via a callback). |
 | `cli.py` | Streams progress, turns each interrupt into a y/n/feedback prompt, and resumes the graph with `Command(resume={interrupt_id: decision})`. It runs the graph with `durability="sync"` on the SQLite checkpointer and offers to resume an interrupted session. |
 | `prompts.py` | System prompt, decision-log section, and the summarization prompt. |
+| `tracing.py` | Optional Arize Phoenix tracing: `configure_tracing()` registers an OTLP exporter (`phoenix.otel.register`) and the OpenInference `LangChainInstrumentor`, and returns a `stop()` that flushes spans. `trace_session()` opens one root span per CLI session, so the start and every resume after an approval form a single trace. |
 | `log.py` | Logging configuration (`dictConfig`): queue handler, background thread, rotating file, UTC timestamps, text or JSON-lines format, `session_id` on every record. `configure_logging()` returns a `stop()` function that flushes the log. |
 
 Safety properties (all covered by tests):
@@ -273,4 +326,5 @@ and don't call any LLM. They cover:
 - `test_memory.py`: summarization with the cheap model (state shrinks, histories stay valid, token totals survive), the limit checks, skipping pointless summaries, the trimming safety net (previews first, then dropping with a note), a regression test that tiny limits never make the agent lose what it read, decisions moving to the store and reaching the prompt even after summarization, `keep_latest` pruning of a half-answered batch, store TTL sweeping, and the CLI wiring
 - `test_resume.py`: resuming in a later run after a crash or Ctrl-C, no stale answers, declining to resume, cleanup after a finished session, one session per folder
 - `test_log.py`: the background log file, text and JSON formats, tracebacks, `session_id` tagging, cleanup, the audit entries, and each decision logged once
+- `test_tracing.py`: the Phoenix options (off by default, flag, env vars, missing extra, a failing flush), and that a session with approvals is exactly one trace: one root span, one graph run per answer, the decisions as events, and aborted/failed sessions marked (uses an in-memory span exporter, no Phoenix needed)
 - `test_demo.py`: keeps the demo sample, `expected.json`, and `demo.py` consistent
