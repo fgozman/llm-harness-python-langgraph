@@ -44,16 +44,40 @@ class UTCFormatter(logging.Formatter):
     default_msec_format = "%s.%03dZ"
 
 
-# The id of the running session. Set by the CLI; SessionFilter copies it onto every record.
-session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
+# Correlation ids, set by the CLI; ContextFilter copies them onto every record.
+# run_id:    a fresh UUID per process run (the "run_id" metadata of the Phoenix root span).
+# thread_id: the LangGraph thread, one per folder; it outlives a run (resume after Ctrl-C)
+#            and is the Phoenix session id.
+run_id: ContextVar[str | None] = ContextVar("run_id", default=None)
+thread_id: ContextVar[str | None] = ContextVar("thread_id", default=None)
+
+try:  # OpenTelemetry comes with the optional "phoenix" extra
+    from opentelemetry.trace import get_current_span
+except ImportError:  # pragma: no cover - depends on the installed extras
+    get_current_span = None
 
 
-class SessionFilter(logging.Filter):
-    """Adds ``session_id`` to each record, so one run can be filtered out of a shared log."""
+def _trace_id() -> str | None:
+    """The id of the current OpenTelemetry trace, in the hex form Phoenix shows; None
+    while tracing is off. (No span id: the LangChain instrumentation doesn't make its
+    node/LLM/tool spans current, so it would always be the session's root span.)"""
+    if get_current_span is None:
+        return None
+    ctx = get_current_span().get_span_context()
+    return format(ctx.trace_id, "032x") if ctx.is_valid else None
+
+
+class ContextFilter(logging.Filter):
+    """Adds ``run_id``, ``thread_id`` and, while tracing, ``trace_id`` to each
+    record, so one run can be filtered out of a shared log and a line can be looked up
+    in Phoenix. Runs in the logging thread (before queueing), where these are current."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if (current := session_id.get()) is not None:
-            record.session_id = current
+        for name, var in (("run_id", run_id), ("thread_id", thread_id)):
+            if (value := var.get()) is not None:
+                setattr(record, name, value)
+        if (trace := _trace_id()) is not None:
+            record.trace_id = trace
         return True  # never drops records, only enriches them
 
 
@@ -114,7 +138,7 @@ def logging_config(log_file: str | Path, level: str, fmt: str = DEFAULT_LOG_FORM
             "json": {"()": JSONFormatter},
         },
         "filters": {
-            "session": {"()": SessionFilter},
+            "context": {"()": ContextFilter},
         },
         "handlers": {
             "file": {
@@ -128,7 +152,7 @@ def logging_config(log_file: str | Path, level: str, fmt: str = DEFAULT_LOG_FORM
             "queue_handler": {
                 "class": TracebackKeepingQueueHandler,
                 "handlers": ["file"],  # dictConfig wraps these in a QueueListener
-                "filters": ["session"],  # runs in the caller's thread, before queueing
+                "filters": ["context"],  # runs in the caller's thread, before queueing
                 "respect_handler_level": True,
             },
         },

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Collection
 from pathlib import Path
+from typing import Any, NamedTuple
 
 from langchain_core.tools import ToolException
 
@@ -18,7 +20,22 @@ DEFAULT_MAX_READ_CHARS = 4_000
 DEFAULT_MAX_LIST_ENTRIES = 500
 MAX_DIRECTORY_DEPTH = 3  # how deep create_directory may nest category folders
 MAX_PATH_CHARS = 1_024
+MAX_RENAME_ATTEMPTS = 1_000  # "name (2).txt" ... "name (1000).txt"
 _BINARY_SNIFF_BYTES = 1_024
+
+
+class Change(NamedTuple):
+    """The result of a filesystem change: the message for the model, and how to undo it.
+
+    ``undo`` is JSON-serializable (it is kept in the decision log) or None when nothing
+    changed on disk (e.g. the directory already existed):
+    * ``{"op": "move", "from": "a.txt", "to": "finance/a.txt"}``
+    * ``{"op": "mkdir", "paths": ["docs", "docs/finance"]}`` (every directory created,
+      parents first)
+    """
+
+    message: str
+    undo: dict[str, Any] | None
 
 
 class WorkspaceError(ToolException):
@@ -36,7 +53,11 @@ class Workspace:
         *,
         max_read_chars: int = DEFAULT_MAX_READ_CHARS,
         max_list_entries: int = DEFAULT_MAX_LIST_ENTRIES,
+        rename_on_clash: bool = False,
     ):
+        """``rename_on_clash``: when a file with the same name is already in the destination
+        directory, move the file there as "name (2).ext" (the first free number) instead
+        of failing. Off by default; existing files are never overwritten either way."""
         root = Path(root).expanduser()
         if not root.exists():
             raise WorkspaceError(f"Folder '{root}' does not exist.")
@@ -45,6 +66,7 @@ class Workspace:
         self.root = root.resolve()
         self.max_read_chars = max_read_chars
         self.max_list_entries = max_list_entries
+        self.rename_on_clash = rename_on_clash
 
     # ------------------------------------------------------------------ helpers
     def _resolve(self, path: str) -> Path:
@@ -118,7 +140,7 @@ class Workspace:
             text = text[: self.max_read_chars] + f"\n[... truncated, file is {size} bytes]"
         return text
 
-    def create_directory(self, path: str) -> str:
+    def create_directory_change(self, path: str) -> Change:
         target = self._resolve(path)
         if target == self.root:
             raise WorkspaceError("Refusing to create the root folder itself.")
@@ -130,13 +152,18 @@ class Workspace:
         if target.exists():
             if not target.is_dir():
                 raise WorkspaceError(f"'{path}' exists and is not a directory.")
-            return f"Directory '{self._rel(target)}' already exists."
+            return Change(f"Directory '{self._rel(target)}' already exists.", None)
+        missing = [p for p in (target, *target.parents) if p != self.root and self.root in p.parents
+                   and not p.exists()]
         target.mkdir(parents=True)
         log.info("Created directory %s", target)
-        return f"Created directory '{self._rel(target)}'."
+        created = [self._rel(p) for p in reversed(missing)]  # parents first
+        return Change(f"Created directory '{self._rel(target)}'.", {"op": "mkdir", "paths": created})
 
-    def move_file(self, source: str, destination: str) -> str:
-        """Move a file into an existing directory, keeping its name (files are never renamed)."""
+    def _move_target(self, source: str, destination: str,
+                     claimed: Collection[str] = ()) -> tuple[Path, Path]:
+        """Validate a move (read-only) and return (source file, destination file path).
+        ``claimed``: relative paths to treat as taken although nothing is there yet."""
         src = self._resolve(source)
         target_dir = self._resolve(destination)
         if not src.exists():
@@ -150,11 +177,71 @@ class Workspace:
                 f"Destination '{destination}' is not a directory; files can only be moved into "
                 "a directory and are never renamed."
             )
+        if src.parent == target_dir:
+            raise WorkspaceError(f"'{self._rel(src)}' is already in '{self._rel(target_dir)}'.")
+
+        def taken(path: Path) -> bool:
+            return path.exists() or path.is_symlink() or self._rel(path) in claimed
 
         dst = target_dir / src.name
-        if dst.exists():
+        if not taken(dst):
+            return src, dst
+        if not self.rename_on_clash:
             raise WorkspaceError(f"Destination '{self._rel(dst)}' already exists; refusing to overwrite.")
+        for n in range(2, MAX_RENAME_ATTEMPTS + 1):
+            candidate = target_dir / f"{src.stem} ({n}){src.suffix}"
+            if not taken(candidate):
+                return src, candidate
+        raise WorkspaceError(f"Too many files named like '{src.name}' in '{self._rel(target_dir)}'.")
 
+    def planned_destination(self, source: str, destination: str,
+                            claimed: Collection[str] = ()) -> str | None:
+        """Where ``move_file_change(source, destination)`` would put the file now (relative
+        path), or None if the move would fail. ``claimed`` are destinations of earlier moves
+        of the same batch, not made yet. Changes nothing."""
+        try:
+            return self._rel(self._move_target(source, destination, claimed)[1])
+        except WorkspaceError:
+            return None
+
+    def move_file_change(self, source: str, destination: str) -> Change:
+        """Move a file into an existing directory, keeping its name (unless renaming on a
+        name clash is enabled). Never overwrites."""
+        src, dst = self._move_target(source, destination)
+        src_rel = self._rel(src)
         shutil.move(src, dst)
         log.info("Moved %s -> %s", src, dst)
-        return f"Moved '{self._rel(src)}' to '{self._rel(dst)}'."
+        message = f"Moved '{src_rel}' to '{self._rel(dst)}'."
+        if dst.name != src.name:
+            message += f" A file named '{src.name}' was already there, so it was renamed to '{dst.name}'."
+        return Change(message, {"op": "move", "from": src_rel, "to": self._rel(dst)})
+
+    # -------------------------------------------------------------------- undo
+    def undo_move(self, moved_to: str, original: str) -> str:
+        """Move a file back to where it was before ``move_file``. Never overwrites."""
+        current = self._resolve(moved_to)
+        back = self._resolve(original)
+        if not current.is_file():
+            raise WorkspaceError(f"'{moved_to}' is no longer there.")
+        if back.exists() or back.is_symlink():
+            raise WorkspaceError(f"'{original}' exists again; refusing to overwrite it.")
+        if not back.parent.is_dir():
+            raise WorkspaceError(f"The original directory of '{original}' no longer exists.")
+        shutil.move(current, back)
+        log.info("Undo: moved %s back to %s", current, back)
+        return f"Moved '{self._rel(current)}' back to '{self._rel(back)}'."
+
+    def remove_empty_directory(self, path: str) -> str:
+        """Remove a directory, but only if it is empty (hidden files count)."""
+        target = self._resolve(path)
+        if target == self.root:
+            raise WorkspaceError("Refusing to remove the root folder itself.")
+        if not target.exists():  # already gone (e.g. a partly finished earlier undo)
+            return f"Directory '{self._rel(target)}' is already gone."
+        if not target.is_dir():
+            raise WorkspaceError(f"'{path}' is not a directory.")
+        if any(target.iterdir()):
+            raise WorkspaceError(f"Directory '{path}' is not empty; kept it.")
+        target.rmdir()
+        log.info("Undo: removed directory %s", target)
+        return f"Removed directory '{self._rel(target)}'."

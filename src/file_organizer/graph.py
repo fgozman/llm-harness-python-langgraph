@@ -52,15 +52,21 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
 
 # LangGraph: the orchestration layer that wires those blocks into a stateful graph.
-from langgraph.checkpoint.base import BaseCheckpointSaver  # interface of all checkpointers
-from langgraph.graph import END, START, StateGraph  # START/END are virtual entry/exit nodes
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,  # interface of all checkpointers
+)
+from langgraph.graph import (  # START/END are virtual entry/exit nodes
+    END,
+    START,
+    StateGraph,
+)
 from langgraph.graph.message import add_messages  # reducer that appends chat messages
 from langgraph.runtime import Runtime  # injected into nodes that ask for it
 from langgraph.store.base import BaseStore  # interface of all stores
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt  # pause the graph and wait for human input
 
-from .approval import Decision, describe, parse_decision
+from .approval import Decision, _safe, describe, parse_decision
 from .memory import (
     ContextPolicy,
     DecisionLog,
@@ -184,10 +190,15 @@ def build_graph(
         else:
             log.info("LLM call #%d done in %.2fs: token usage not reported", call_no, elapsed,
                      extra={"llm_call": call_no, "duration_s": round(elapsed, 3)})
+        # INFO keeps only names and sizes; arguments and text (which can quote what the
+        # files say) are DEBUG. Approved changes are still logged with their paths by the
+        # workspace (the audit trail).
         for tc in response.tool_calls:
-            log.info("Model requested %s(%s)", tc["name"], tc["args"])
+            log.info("Model requested %s", tc["name"], extra={"tool": tc["name"]})
+            log.debug("Model requested %s(%s)", tc["name"], tc["args"])
         if not response.tool_calls:
-            log.info("Model finished: %s", response.text)
+            log.info("Model finished (%d chars)", len(response.text))
+            log.debug("Model finished: %s", response.text)
         # Partial update: only the NEW message (appended by add_messages) and this
         # call's tokens (added to the totals by add_usage); "decisions" is untouched.
         return {"messages": [response], "usage": this_call.as_dict()}
@@ -213,21 +224,51 @@ def build_graph(
         4. Once every interrupt() has an answer, the node returns normally.
         """
         decisions = {}
-        for tc in tool_calls(state):
-            if tc["name"] in MUTATING_TOOLS:
-                # Pauses the run and shows this dict to the caller, who later resumes
-                # with Command(resume=answer); interrupt() then returns that answer.
-                # The payload must be serializable: it is stored in the checkpoint.
-                answer = interrupt(
-                    {
-                        "tool_call_id": tc["id"],
-                        "tool": tc["name"],
-                        "args": tc["args"],
-                        "description": describe(tc["name"], tc["args"]),
-                    }
-                )
-                decisions[tc["id"]] = parse_decision(answer)
+        changes = [tc for tc in tool_calls(state) if tc["name"] in MUTATING_TOOLS]
+        # The whole batch goes with every question, so the caller can show the full
+        # plan before the first answer (and offer "approve all remaining").
+        batch = [{"tool_call_id": tc["id"], "description": describe(tc["name"], tc["args"])}
+                 for tc in changes]
+        claimed: set[str] = set()  # destinations of earlier approved moves of this batch
+        for index, tc in enumerate(changes):
+            planned = _planned_move(tc, claimed)
+            # Pauses the run and shows this dict to the caller, who later resumes
+            # with Command(resume=answer); interrupt() then returns that answer.
+            # The payload must be serializable: it is stored in the checkpoint.
+            answer = interrupt(
+                {
+                    "tool_call_id": tc["id"],
+                    "tool": tc["name"],
+                    "args": tc["args"],
+                    "description": describe(tc["name"], tc["args"]) + _clash_note(tc, planned),
+                    "index": index,
+                    "batch": batch,
+                }
+            )
+            decisions[tc["id"]] = parse_decision(answer)
+            if planned is not None and decisions[tc["id"]]["approved"]:
+                claimed.add(planned)
         return {"decisions": decisions}
+
+    def _planned_move(tc: dict[str, Any], claimed: set[str]) -> str | None:
+        """Where an approved move_file call will put the file (relative path), counting
+        the destinations claimed by earlier moves of the batch; None if it is not a move
+        or would fail. (A read-only check, so it is safe in the review node.)"""
+        args = tc["args"] if isinstance(tc["args"], dict) else {}
+        if tc["name"] != "move_file":
+            return None
+        source, destination = args.get("source"), args.get("destination")
+        if not isinstance(source, str) or not isinstance(destination, str):
+            return None
+        return workspace.planned_destination(source, destination, claimed)
+
+    def _clash_note(tc: dict[str, Any], planned: str | None) -> str:
+        """With rename-on-clash, tell the human up front if the file will get a new name."""
+        if planned is None or not workspace.rename_on_clash:
+            return ""
+        if planned.rsplit("/", 1)[-1] == tc["args"]["source"].rsplit("/", 1)[-1]:
+            return ""
+        return f" (name taken there; will be saved as '{_safe(planned)}')"
 
     def run_tools(state: AgentState, runtime: Runtime) -> dict[str, Any]:
         """Node: execute the tool calls (what langgraph.prebuilt.ToolNode does, plus the
@@ -270,6 +311,8 @@ def build_graph(
                     "outcome": outcome,
                     "result": str(result.content)[:500],
                     "decided_at": now_iso(),
+                    # How to reverse it (for --undo); None if nothing changed on disk.
+                    "undo": result.artifact if outcome == "applied" else None,
                 })
 
         for msg in results:

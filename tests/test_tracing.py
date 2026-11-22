@@ -138,6 +138,31 @@ def test_a_session_with_approvals_is_one_trace(folder: Path, captured_spans):
     assert [(d["approved"], d["feedback"]) for d in decisions] == [(True, ""), (False, "no, use invoices")]
 
 
+def test_log_lines_carry_the_trace_id(folder: Path, tmp_path: Path, captured_spans):
+    from file_organizer.log import configure_logging
+
+    log_file = tmp_path / "session.jsonl"
+    stop = configure_logging(log_file, fmt="json")
+    try:
+        run(folder, _session_model(), input_fn=scripted_input("y", "y"), output_fn=lambda *_: None)
+    finally:
+        stop()
+
+    spans = captured_spans.get_finished_spans()
+    [trace_id] = {format(span.context.trace_id, "032x") for span in spans}
+    root = next(s for s in spans if s.parent is None)
+
+    entries = [json.loads(line) for line in log_file.read_text().splitlines()]
+    traced = [e for e in entries if "trace_id" in e]
+    assert traced and {e["trace_id"] for e in traced} == {trace_id}
+    # The log's run_id is the run_id metadata on the root span.
+    assert {e["run_id"] for e in traced} == {json.loads(root.attributes["metadata"])["run_id"]}
+    # Everything inside the session is traced: the start, the LLM calls, the changes.
+    messages = [e["message"] for e in traced]
+    assert any(m.startswith("Run ") for m in messages)
+    assert any(m.startswith("Created directory") for m in messages)
+
+
 def test_an_aborted_session_is_marked_on_the_root_span(folder: Path, captured_spans):
     def ctrl_c(prompt=""):
         raise KeyboardInterrupt

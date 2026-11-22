@@ -78,69 +78,69 @@ class TestReadFile:
 
 class TestCreateDirectory:
     def test_creates_directory(self, ws: Workspace, root: Path):
-        msg = ws.create_directory("finance")
+        msg = ws.create_directory_change("finance").message
         assert (root / "finance").is_dir()
         assert "finance" in msg
 
     def test_creates_nested_directories(self, ws: Workspace, root: Path):
-        ws.create_directory("finance/2024")
+        ws.create_directory_change("finance/2024")
         assert (root / "finance" / "2024").is_dir()
 
     def test_existing_directory_is_ok(self, ws: Workspace):
-        assert "already exists" in ws.create_directory("docs")
+        assert "already exists" in ws.create_directory_change("docs").message
 
     def test_conflicting_file_raises(self, ws: Workspace):
         with pytest.raises(WorkspaceError, match="not a directory"):
-            ws.create_directory("invoice.txt")
+            ws.create_directory_change("invoice.txt")
 
 
 class TestMoveFile:
     def test_moves_file_into_existing_directory(self, ws: Workspace, root: Path):
-        ws.create_directory("finance")
-        ws.move_file("invoice.txt", "finance")
+        ws.create_directory_change("finance")
+        ws.move_file_change("invoice.txt", "finance")
         assert not (root / "invoice.txt").exists()
         assert (root / "finance" / "invoice.txt").read_text().startswith("Invoice")
 
     def test_moves_file_into_nested_directory(self, ws: Workspace, root: Path):
-        ws.create_directory("docs/finance")
-        ws.move_file("invoice.txt", "docs/finance")
+        ws.create_directory_change("docs/finance")
+        ws.move_file_change("invoice.txt", "docs/finance")
         assert (root / "docs" / "finance" / "invoice.txt").exists()
 
     @pytest.mark.parametrize("destination", ["ghost", "finance/invoice-42.txt", "docs/renamed.txt"])
     def test_never_renames_destination_must_be_an_existing_directory(
         self, ws: Workspace, root: Path, destination: str
     ):
-        ws.create_directory("finance")
+        ws.create_directory_change("finance")
         with pytest.raises(WorkspaceError, match="does not exist"):
-            ws.move_file("invoice.txt", destination)
+            ws.move_file_change("invoice.txt", destination)
         assert (root / "invoice.txt").exists()  # untouched
         assert not (root / destination).exists()
 
     def test_destination_cannot_be_an_existing_file(self, ws: Workspace, root: Path):
         with pytest.raises(WorkspaceError, match="not a directory"):
-            ws.move_file("invoice.txt", "flight.txt")
+            ws.move_file_change("invoice.txt", "flight.txt")
         assert (root / "invoice.txt").exists()
         assert (root / "flight.txt").read_text().startswith("Boarding")
 
     def test_moving_into_its_current_directory_is_rejected(self, ws: Workspace, root: Path):
-        with pytest.raises(WorkspaceError, match="already exists"):
-            ws.move_file("invoice.txt", ".")
+        with pytest.raises(WorkspaceError, match="already in"):
+            ws.move_file_change("invoice.txt", ".")
         assert (root / "invoice.txt").exists()
 
     def test_never_overwrites(self, ws: Workspace, root: Path):
         (root / "docs" / "invoice.txt").write_text("other")
         with pytest.raises(WorkspaceError, match="already exists"):
-            ws.move_file("invoice.txt", "docs")
+            ws.move_file_change("invoice.txt", "docs")
         assert (root / "docs" / "invoice.txt").read_text() == "other"
         assert (root / "invoice.txt").exists()
 
     def test_source_must_be_a_file(self, ws: Workspace):
         with pytest.raises(WorkspaceError, match="not a file"):
-            ws.move_file("docs", "elsewhere")
+            ws.move_file_change("docs", "elsewhere")
 
     def test_missing_source_raises(self, ws: Workspace):
         with pytest.raises(WorkspaceError, match="not found"):
-            ws.move_file("ghost.txt", "docs")
+            ws.move_file_change("ghost.txt", "docs")
 
 
 class TestSandbox:
@@ -149,9 +149,9 @@ class TestSandbox:
         with pytest.raises(WorkspaceError, match="outside"):
             ws.read_file(path)
         with pytest.raises(WorkspaceError, match="outside"):
-            ws.create_directory(path)
+            ws.create_directory_change(path)
         with pytest.raises(WorkspaceError, match="outside"):
-            ws.move_file("invoice.txt", path)
+            ws.move_file_change("invoice.txt", path)
 
     def test_symlink_escape_is_rejected(self, ws: Workspace, root: Path, tmp_path_factory):
         outside = tmp_path_factory.mktemp("outside")
@@ -167,16 +167,16 @@ class TestGuardrails:
         with pytest.raises(WorkspaceError, match="hidden"):
             ws.read_file(".env")
         with pytest.raises(WorkspaceError, match="hidden"):
-            ws.move_file(".env", "docs")
+            ws.move_file_change(".env", "docs")
         with pytest.raises(WorkspaceError, match="hidden"):
-            ws.create_directory(".git/hooks")
+            ws.create_directory_change(".git/hooks")
 
     def test_symlinks_are_refused_and_not_listed(self, ws: Workspace, root: Path):
         (root / "link.txt").symlink_to(root / "invoice.txt")
         (root / "linkdir").symlink_to(root / "docs")
         assert "link.txt" not in ws.list_files()
         with pytest.raises(WorkspaceError, match="symlink"):
-            ws.move_file("link.txt", "docs")
+            ws.move_file_change("link.txt", "docs")
         with pytest.raises(WorkspaceError, match="symlink"):
             ws.read_file("linkdir/nested.md")
         assert (root / "invoice.txt").exists()
@@ -197,6 +197,77 @@ class TestGuardrails:
 
     def test_directory_depth_is_limited(self, ws: Workspace):
         with pytest.raises(WorkspaceError, match="levels deep"):
-            ws.create_directory("a/b/c/d")
+            ws.create_directory_change("a/b/c/d")
         with pytest.raises(WorkspaceError, match="root"):
-            ws.create_directory(".")
+            ws.create_directory_change(".")
+
+
+class TestRenameOnClash:
+    @pytest.fixture
+    def ws(self, root: Path) -> Workspace:
+        (root / "docs" / "invoice.txt").write_text("other")
+        return Workspace(root, rename_on_clash=True)
+
+    def test_off_by_default(self, root: Path):
+        assert Workspace(root).rename_on_clash is False
+
+    def test_takes_the_first_free_name_and_overwrites_nothing(self, ws: Workspace, root: Path):
+        (root / "docs" / "invoice (2).txt").write_text("other 2")
+        change = ws.move_file_change("invoice.txt", "docs")
+        assert (root / "docs" / "invoice (3).txt").read_text().startswith("Invoice")
+        assert (root / "docs" / "invoice.txt").read_text() == "other"
+        assert (root / "docs" / "invoice (2).txt").read_text() == "other 2"
+        assert "renamed to 'invoice (3).txt'" in change.message
+        assert change.undo == {"op": "move", "from": "invoice.txt", "to": "docs/invoice (3).txt"}
+
+    def test_planned_destination_changes_nothing(self, ws: Workspace, root: Path):
+        assert ws.planned_destination("invoice.txt", "docs") == "docs/invoice (2).txt"
+        assert ws.planned_destination("ghost.txt", "docs") is None
+        assert (root / "invoice.txt").exists()
+
+    def test_planned_destination_counts_claimed_destinations(self, ws: Workspace, root: Path):
+        (root / "docs" / "invoice.txt").unlink()
+        assert ws.planned_destination("invoice.txt", "docs") == "docs/invoice.txt"
+        claimed = {"docs/invoice.txt"}
+        assert ws.planned_destination("invoice.txt", "docs", claimed) == "docs/invoice (2).txt"
+
+    def test_moving_into_its_own_directory_is_still_rejected(self, ws: Workspace, root: Path):
+        with pytest.raises(WorkspaceError, match="already in"):
+            ws.move_file_change("invoice.txt", ".")
+        assert sorted(p.name for p in root.iterdir()) == ["docs", "flight.txt", "invoice.txt"]
+
+
+class TestUndoSupport:
+    def test_create_directory_reports_every_directory_it_created(self, ws: Workspace):
+        assert ws.create_directory_change("a/b/c").undo == {"op": "mkdir", "paths": ["a", "a/b", "a/b/c"]}
+        assert ws.create_directory_change("docs/x").undo == {"op": "mkdir", "paths": ["docs/x"]}
+        assert ws.create_directory_change("docs").undo is None  # already existed
+
+    def test_undo_move_puts_the_file_back(self, ws: Workspace, root: Path):
+        ws.move_file_change("invoice.txt", "docs")
+        ws.undo_move("docs/invoice.txt", "invoice.txt")
+        assert (root / "invoice.txt").exists() and not (root / "docs" / "invoice.txt").exists()
+
+    def test_undo_move_never_overwrites(self, ws: Workspace, root: Path):
+        ws.move_file_change("invoice.txt", "docs")
+        (root / "invoice.txt").write_text("new file")
+        with pytest.raises(WorkspaceError, match="refusing to overwrite"):
+            ws.undo_move("docs/invoice.txt", "invoice.txt")
+        assert (root / "invoice.txt").read_text() == "new file"
+
+    def test_undo_move_is_sandboxed(self, ws: Workspace):
+        with pytest.raises(WorkspaceError, match="outside"):
+            ws.undo_move("invoice.txt", "../stolen.txt")
+
+    def test_remove_empty_directory_only_when_empty(self, ws: Workspace, root: Path):
+        (root / "empty").mkdir()
+        (root / "hidden").mkdir()
+        (root / "hidden" / ".DS_Store").write_text("")
+        ws.remove_empty_directory("empty")
+        assert not (root / "empty").exists()
+        assert "already gone" in ws.remove_empty_directory("empty")
+        for path in ("docs", "hidden"):
+            with pytest.raises(WorkspaceError, match="not empty"):
+                ws.remove_empty_directory(path)
+        with pytest.raises(WorkspaceError, match="root"):
+            ws.remove_empty_directory(".")

@@ -278,6 +278,8 @@ def test_finalized_decisions_move_from_state_to_store(workspace: Workspace, fold
         ("Create directory 'finance'", "applied"),
         ("Move 'invoice.txt' -> 'nope'", "failed"),
     ]
+    # applied changes record how to undo them; failed ones have nothing to undo
+    assert [r["undo"] for r in records] == [{"op": "mkdir", "paths": ["finance"]}, None]
     result = graph.invoke(Command(resume={"approved": False, "feedback": "no junk"}), CONFIG)
     assert DecisionLog(store, "t").records()[-1]["outcome"] == "rejected"
 

@@ -137,8 +137,8 @@ def test_each_change_in_a_batch_is_approved_separately(workspace: Workspace, fol
     assert not (folder / "junk").exists()
     assert (folder / "health").is_dir()
     # one result per tool call, in the original order
-    assert [m.content.split()[0] for m in tool_messages(result)] == [
-        "Created", "<file", "Rejected", "Created",
+    assert [m.content.split()[0][:5] for m in tool_messages(result)] == [
+        "Creat", "<file", "Rejec", "Creat",
     ]
 
 
@@ -241,3 +241,61 @@ def test_describe_escapes_control_characters():
 
     text = describe("move_file", {"source": "a.txt\n? Create directory 'x'\x1b[2K", "destination": "d"})
     assert "\n" not in text and "\x1b" not in text
+
+
+def test_every_question_carries_the_whole_batch(workspace: Workspace):
+    graph, _ = make(
+        workspace,
+        ai(call("create_directory", path="finance"), call("list_files"),
+           call("move_file", source="invoice.txt", destination="finance")),
+        ai(content="ok"),
+    )
+    first = interrupts(start(graph))[0]
+    second = interrupts(graph.invoke(Command(resume=True), CONFIG))[0]
+    plan = ["Create directory 'finance'", "Move 'invoice.txt' -> 'finance'"]
+    assert [item["description"] for item in first["batch"]] == plan  # read-only calls left out
+    assert (first["index"], second["index"]) == (0, 1)
+    assert second["batch"] == first["batch"]
+
+
+def test_rename_on_clash_is_announced_in_the_question(folder: Path):
+    (folder / "finance").mkdir()
+    (folder / "finance" / "invoice.txt").write_text("older invoice")
+    graph, _ = make(
+        Workspace(folder, rename_on_clash=True),
+        ai(call("move_file", source="invoice.txt", destination="finance")),
+        ai(content="ok"),
+    )
+    question = interrupts(start(graph))[0]
+    assert question["description"] == (
+        "Move 'invoice.txt' -> 'finance' (name taken there; will be saved as 'finance/invoice (2).txt')")
+    result = graph.invoke(Command(resume=True), CONFIG)
+    assert (folder / "finance" / "invoice (2).txt").read_text().startswith("Invoice #42")
+    assert (folder / "finance" / "invoice.txt").read_text() == "older invoice"
+    assert "renamed" in tool_messages(result)[-1].content
+
+
+@pytest.mark.parametrize("first_answer, expected_note", [
+    (True, " (name taken there; will be saved as 'finance/report (2).txt')"),
+    (False, ""),  # the first move was rejected: the name stays free
+])
+def test_rename_on_clash_counts_earlier_moves_of_the_batch(folder: Path, first_answer, expected_note):
+    for sub in ("a", "b", "finance"):
+        (folder / sub).mkdir()
+    (folder / "a" / "report.txt").write_text("report a")
+    (folder / "b" / "report.txt").write_text("report b")
+    graph, _ = make(
+        Workspace(folder, rename_on_clash=True),
+        ai(call("move_file", source="a/report.txt", destination="finance"),
+           call("move_file", source="b/report.txt", destination="finance")),
+        ai(content="ok"),
+    )
+    first = interrupts(start(graph))[0]
+    assert first["description"] == "Move 'a/report.txt' -> 'finance'"
+    second = interrupts(graph.invoke(Command(resume=first_answer), CONFIG))[0]
+    assert second["description"] == "Move 'b/report.txt' -> 'finance'" + expected_note
+    graph.invoke(Command(resume=True), CONFIG)
+    if first_answer:
+        assert (folder / "finance" / "report (2).txt").read_text() == "report b"
+    else:
+        assert (folder / "finance" / "report.txt").read_text() == "report b"

@@ -81,8 +81,27 @@ def test_main_logs_the_session_and_changes(folder: Path, tmp_path: Path, monkeyp
     assert code == 0
     text = log_file.read_text()
     for expected in ["Session", "started", "Model requested create_directory",
-                     "User approved", "Created directory", "Model finished: All done."]:
+                     "User approved", "Created directory", "Model finished (9 chars)"]:
         assert expected in text, expected
+
+
+def test_model_text_and_tool_arguments_are_only_logged_at_debug(folder: Path, tmp_path: Path,
+                                                                monkeypatch):
+    def run_at(level: str) -> str:
+        log_file = tmp_path / f"{level}.log"
+        model = ScriptedChatModel(responses=[
+            ai(call("read_file", path="bloodwork.txt")), ai(content="Your blood test was fine."),
+        ])
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        main([str(folder), "--log-file", str(log_file), "--log-level", level],
+             model_factory=lambda name: model)
+        return log_file.read_text()
+
+    info = run_at("INFO")
+    assert "Model requested read_file" in info and "bloodwork.txt" not in info
+    assert "blood test" not in info
+    debug = run_at("DEBUG")
+    assert "read_file({'path': 'bloodwork.txt'})" in debug and "blood test" in debug
 
 
 def test_main_logs_model_failures_with_traceback(folder: Path, tmp_path: Path):
@@ -175,7 +194,7 @@ def test_text_format_still_appends_tracebacks(tmp_path: Path):
     assert "- it failed\nTraceback" in text and "ValueError: boom" in text
 
 
-def test_main_tags_every_session_record_with_the_session_id(folder: Path, tmp_path: Path, monkeypatch):
+def test_main_tags_every_session_record_with_run_and_thread_ids(folder: Path, tmp_path: Path, monkeypatch):
     log_file = tmp_path / "session.log"
     model = ScriptedChatModel(
         responses=[ai(call("list_files")), ai(call("create_directory", path="x")), ai(content="ok")]
@@ -187,8 +206,10 @@ def test_main_tags_every_session_record_with_the_session_id(folder: Path, tmp_pa
 
     entries = read_json_lines(log_file)
     session = [e for e in entries if e["function"] != "main"]  # main logs before the session
-    ids = {e.get("session_id") for e in session}
+    ids = {e.get("run_id") for e in session}
     assert len(session) > 3 and len(ids) == 1 and None not in ids
+    assert {e.get("thread_id") for e in session} == {f"organize:{folder.resolve()}"}
+    assert not any("trace_id" in e for e in entries)  # tracing is off
     assert any(e["logger"] == "file_organizer.workspace" for e in session)  # tool code too
 
 

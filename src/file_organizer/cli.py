@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage
 
 # Command is the input you send to a graph to control it rather than to add data,
 # here: Command(resume=...) answers a pending interrupt() and continues the run.
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from .approval import Decision
@@ -30,8 +31,9 @@ from .log import (
     LOG_FORMATS,
     LOG_LEVELS,
     configure_logging,
-    session_id,
+    run_id,
 )
+from .log import thread_id as log_thread_id
 from .memory import ContextPolicy, DecisionLog
 from .persistence import DEFAULT_STATE_DB, sqlite_checkpointer, sqlite_store
 from .prompts import START_MESSAGE
@@ -43,6 +45,7 @@ from .tracing import (
     configure_tracing,
     trace_session,
 )
+from .undo import plan_undo, undo_all
 from .usage import TokenUsage
 from .workspace import Workspace, WorkspaceError
 
@@ -56,28 +59,57 @@ RESUME_HINT = "Progress is saved; run the same command again to resume."
 # Max graph steps (super-steps, i.e. node executions here) per run. LangGraph raises
 # GraphRecursionError when it is exceeded. Its default is ~10,000, so lower it to fail
 # fast if the model gets stuck in a loop. Each tool round trip takes 4 steps
-# (summarize, agent, review, tools).
-RECURSION_LIMIT = 300
+# (summarize, agent, review, tools). Set with --recursion-limit / FILE_ORGANIZER_RECURSION_LIMIT.
+DEFAULT_RECURSION_LIMIT = 300
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], Any]
 
 
-def ask_approval(request: dict[str, Any], input_fn: InputFn, output_fn: OutputFn) -> Decision:
+class Answer(NamedTuple):
+    """The human's answer to one question; ``approve_rest`` also approves every later
+    change of the same batch (the plan shown before the first question)."""
+
+    decision: Decision
+    approve_rest: bool = False
+
+
+def remaining_in_batch(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """This change and the ones after it in its batch ({tool_call_id, description})."""
+    batch = request.get("batch") or [{"tool_call_id": request["tool_call_id"],
+                                      "description": request["description"]}]
+    return batch[request.get("index", 0):]
+
+
+def show_plan(request: dict[str, Any], output_fn: OutputFn) -> None:
+    """Print every change still to be decided in this batch, before the first question."""
+    remaining = remaining_in_batch(request)
+    output_fn(f"\nProposed changes ({len(remaining)}):")
+    for number, item in enumerate(remaining, 1):
+        output_fn(f"  {number:>3}. {item['description']}")
+
+
+def ask_approval(request: dict[str, Any], input_fn: InputFn, output_fn: OutputFn) -> Answer:
     """Ask the human about one proposed change.
 
     "y"/"yes" approves, "n"/"no" rejects, and any other text rejects and is passed to
-    the model as feedback. An empty answer asks again.
+    the model as feedback. If more changes of the same batch follow, "a"/"all" approves
+    this one and all of them (for the last change it just approves it, so an "a" typed
+    out of habit doesn't reject it as feedback). An empty answer asks again.
     """
+    remaining = len(remaining_in_batch(request))
     output_fn(f"\n? {request['description']}")
+    all_option = f" / [a]ll {remaining} remaining" if remaining > 1 else ""
     answer = ""
     while not answer:
-        answer = input_fn("  approve? [y]es / [n]o / or type feedback to reject: ").strip()
-    if answer.lower() in {"y", "yes"}:
-        return {"approved": True, "feedback": None}
+        answer = input_fn(f"  approve? [y]es / [n]o{all_option} / or type feedback to reject: ").strip()
+    if answer.lower() in {"y", "yes"} or (not all_option and answer.lower() in {"a", "all"}):
+        return Answer({"approved": True, "feedback": None})
     if answer.lower() in {"n", "no"}:
-        return {"approved": False, "feedback": None}
-    return {"approved": False, "feedback": answer}
+        return Answer({"approved": False, "feedback": None})
+    if answer.lower() in {"a", "all"}:
+        return Answer({"approved": True, "feedback": None}, approve_rest=True)
+    return Answer({"approved": False, "feedback": answer})
 
 
 def default_summary_model(model: str) -> str:
@@ -174,6 +206,8 @@ def run(
     input_fn: InputFn = input,
     output_fn: OutputFn = print,
     state_db: str | Path = DEFAULT_STATE_DB,
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT,
+    rename_on_clash: bool = False,
 ) -> int:
     """Organize ``folder`` interactively. Returns a process exit code.
 
@@ -181,21 +215,24 @@ def run(
     stops early (Ctrl-C, crash, model/API error), running it again on the same folder
     offers to resume it where it stopped. Finalized decisions are kept in the same
     file's store; ``summary_model`` (cheap) summarizes old messages per ``policy``.
+    ``recursion_limit`` caps graph steps per run; ``rename_on_clash`` lets a moved file
+    take a free name when its name is taken in the destination.
     """
-    workspace = Workspace(folder)
+    workspace = Workspace(folder, rename_on_clash=rename_on_clash)
     # A "thread" is one persisted conversation/run. Its id is chosen by us and selects
     # which saved state the checkpointer loads and writes. One saved session per
     # folder: the same folder always maps to the same thread.
-    thread_id = f"organize:{workspace.root}"
+    thread_id = thread_id_for(workspace)
     # The RunnableConfig passed to every graph call. "configurable.thread_id" is
     # required as soon as the graph has a checkpointer.
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
 
     output_fn(f"Organizing {workspace.root}")
-    # Tag every log record of this run with a fresh id (a "session_id" field in JSON logs).
-    session_token = session_id.set(str(uuid.uuid4()))
+    # Tag every log record of this run with a fresh run id and the thread id ("run_id" and
+    # "thread_id" fields in JSON logs; the same ids are on the Phoenix trace).
+    run_token = run_id.set(str(uuid.uuid4()))
+    thread_token = log_thread_id.set(thread_id)
     usage = SessionUsage()  # token totals of this session (including resumed earlier runs)
-    log.info("Run %s started on %s (state: %s)", session_id.get(), workspace.root, state_db)
     try:
         # LangGraph's SQLite checkpointer (graph state per thread_id) and store (finalized
         # decisions, with a TTL), both in the state_db file.
@@ -203,11 +240,13 @@ def run(
         # every resume after an approval) is one trace, under one root span.
         with (
             trace_session(thread_id, input=f"Organize {workspace.root}",
-                          metadata={"run_id": session_id.get(),
+                          metadata={"run_id": run_id.get(),
                                     "folder": str(workspace.root)}) as trace,
             sqlite_checkpointer(state_db) as checkpointer,
             sqlite_store(state_db) as store,
         ):
+            # Inside the root span, so this line carries the trace_id when tracing is on.
+            log.info("Run %s started on %s (state: %s)", run_id.get(), workspace.root, state_db)
             graph = build_graph(model, workspace, checkpointer=checkpointer, store=store,
                                 summary_model=summary_model, policy=policy)
 
@@ -232,12 +271,27 @@ def run(
                 DecisionLog(store, thread_id).clear()
                 run_name = "organize"
 
+            # tool_call_ids approved in advance with "all"; only ever ids of the plan
+            # that was shown, so a later batch is always asked about again.
+            approved_in_advance: set[str] = set()
+            plans_shown: set[str] = set()  # batches (by first tool_call_id) already shown
             while True:
                 if pending is not None:
-                    # Answer exactly this question (by interrupt id), so an old answer can
-                    # never be applied to a different question after a restart.
-                    decision = ask_approval(pending.value, input_fn, output_fn)
-                    trace.decision(pending.value, decision)
+                    request = pending.value
+                    remaining = remaining_in_batch(request)
+                    if request["tool_call_id"] in approved_in_advance:
+                        decision: Decision = {"approved": True, "feedback": None}
+                        output_fn(f"  ✓ {request['description']} (approved with 'all')")
+                    else:
+                        batch_key = (request.get("batch") or remaining)[0]["tool_call_id"]
+                        if len(remaining) > 1 and batch_key not in plans_shown:
+                            show_plan(request, output_fn)
+                            plans_shown.add(batch_key)
+                        decision, approve_rest = ask_approval(request, input_fn, output_fn)
+                        if approve_rest:
+                            approved_in_advance |= {item["tool_call_id"] for item in remaining[1:]}
+                            log.info("User approved all %d remaining changes of the batch", len(remaining))
+                    trace.decision(request, decision)
                     answer = "approved" if decision["approved"] else "rejected"
                     run_name = f"resume: {answer} {pending.value['description']}"[:120]
                     # A dict keyed by interrupt ids is a "resume map"; a plain value
@@ -283,12 +337,80 @@ def run(
     except Exception as exc:  # model/API failures: short message here, traceback in the log
         log.exception("Session failed")
         output_fn(f"error: {type(exc).__name__}: {exc}")
+        if isinstance(exc, GraphRecursionError):
+            output_fn(f"The agent took more than {recursion_limit} steps; raise the limit "
+                      "with --recursion-limit (or FILE_ORGANIZER_RECURSION_LIMIT).")
         output_fn("Changes approved so far have been applied; nothing else was modified.")
         _report_usage(usage, output_fn)
         output_fn(RESUME_HINT)
         return 1
     finally:
-        session_id.reset(session_token)
+        log_thread_id.reset(thread_token)
+        run_id.reset(run_token)
+
+
+def thread_id_for(workspace: Workspace) -> str:
+    """The LangGraph thread of a folder: one saved session (and decision log) per folder."""
+    return f"organize:{workspace.root}"
+
+
+def undo(
+    folder: str | Path,
+    *,
+    input_fn: InputFn = input,
+    output_fn: OutputFn = print,
+    state_db: str | Path = DEFAULT_STATE_DB,
+) -> int:
+    """Reverse the changes applied by the folder's last session (from its decision log).
+
+    Shows the whole undo plan and asks once before changing anything. Also discards an
+    interrupted session of the folder, which could not be resumed after an undo.
+    Returns 0 if everything was undone (or there was nothing to undo), 1 otherwise.
+    """
+    workspace = Workspace(folder)
+    thread_id = thread_id_for(workspace)
+    run_token = run_id.set(str(uuid.uuid4()))
+    thread_token = log_thread_id.set(thread_id)
+    try:
+        with sqlite_checkpointer(state_db) as checkpointer, sqlite_store(state_db) as store:
+            decisions = DecisionLog(store, thread_id)
+            steps, unknown = plan_undo(decisions.entries())
+            output_fn(f"Undo in {workspace.root}")
+            if unknown:
+                output_fn(f"  ! {len(unknown)} applied change(s) were recorded without undo "
+                          "information and can't be undone.")
+            if not steps:
+                output_fn("Nothing to undo for this folder (decisions are kept for 7 days, "
+                          "and until a new session starts).")
+                return 0
+            output_fn(f"\nUndo plan ({len(steps)} steps, newest change first):")
+            for number, step in enumerate(steps, 1):
+                output_fn(f"  {number:>3}. {step.description}")
+            interrupted = checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+            if interrupted is not None:
+                output_fn("  (the interrupted session for this folder will be discarded)")
+            if not confirm("\nUndo these changes?", input_fn):
+                output_fn("Nothing was changed.")
+                return 0
+            log.info("Undoing %d steps", len(steps))
+            result = undo_all(workspace, decisions, steps)
+            checkpointer.prune([thread_id], strategy="delete")
+            for step, error in result.failed:
+                output_fn(f"  ! {step.description}: {error}")
+            output_fn(f"\nUndone: {len(result.done)} of {len(steps)} steps.")
+            if result.failed:
+                output_fn("Fix the conflicts above and run --undo again to retry the rest.")
+                return 1
+            if not unknown:
+                decisions.clear()  # rejected/failed records too: the session is fully undone
+            log.info("Undo finished")
+            return 0
+    except (KeyboardInterrupt, EOFError):
+        output_fn("\nAborted.")
+        return 130
+    finally:
+        log_thread_id.reset(thread_token)
+        run_id.reset(run_token)
 
 
 def _env_flag(name: str) -> bool:
@@ -348,6 +470,28 @@ def main(
         "(default: $FILE_ORGANIZER_MAX_CONTEXT_TOKENS or %(default)s)",
     )
     parser.add_argument(
+        "--recursion-limit",
+        type=_positive_int,
+        default=os.environ.get("FILE_ORGANIZER_RECURSION_LIMIT", str(DEFAULT_RECURSION_LIMIT)),
+        metavar="STEPS",
+        help="max graph steps per run before giving up (each tool round trip takes 4) "
+        "(default: $FILE_ORGANIZER_RECURSION_LIMIT or %(default)s)",
+    )
+    parser.add_argument(
+        "--rename-on-clash",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("FILE_ORGANIZER_RENAME_ON_CLASH"),
+        help="when a file with the same name already exists in the destination, move the "
+        "file as 'name (2).ext' instead of failing; nothing is ever overwritten "
+        "(default: $FILE_ORGANIZER_RENAME_ON_CLASH or off)",
+    )
+    parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="reverse the changes applied by the folder's last session (moves files back, "
+        "removes the directories it created if empty), after showing the plan",
+    )
+    parser.add_argument(
         "--log-file",
         default=os.environ.get("FILE_ORGANIZER_LOG_FILE", DEFAULT_LOG_FILE),
         help="where to write the log (default: $FILE_ORGANIZER_LOG_FILE or %(default)s)",
@@ -401,6 +545,14 @@ def main(
         parser.error(str(exc))  # exits with code 2
 
     stop_logging = configure_logging(args.log_file, args.log_level, args.log_format)
+    if args.undo:  # no model, no tracing
+        try:
+            return undo(args.folder, state_db=args.state_db)
+        except WorkspaceError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            stop_logging()
     stop_tracing: Callable[[], None] | None = None
     try:
         if args.phoenix:
@@ -421,7 +573,8 @@ def main(
         summary_model = model if model_name == args.model else model_factory(model_name)
         log.info("Using model %s, summarizing with %s", args.model, model_name)
         return run(args.folder, model, summary_model=summary_model, policy=policy,
-                   state_db=args.state_db)
+                   state_db=args.state_db, recursion_limit=args.recursion_limit,
+                   rename_on_clash=args.rename_on_clash)
     except WorkspaceError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

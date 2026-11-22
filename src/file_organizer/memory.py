@@ -33,11 +33,17 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
@@ -303,6 +309,7 @@ class DecisionRecord(TypedDict):
     outcome: Literal["applied", "failed", "rejected"]
     result: str  # what the tool (or the rejection) reported to the model
     decided_at: str  # ISO-8601 UTC, also used for ordering
+    undo: NotRequired[dict[str, Any] | None]  # how to reverse an applied change (Change.undo)
 
 
 def decisions_namespace(thread_id: str) -> tuple[str, ...]:
@@ -339,6 +346,17 @@ class DecisionLog:
         """
         items = self.store.search(self.namespace, limit=limit, refresh_ttl=refresh_ttl)  # default limit is 10!
         return sorted((item.value for item in items), key=lambda v: v["decided_at"])  # type: ignore[return-value]
+
+    def entries(self) -> list[tuple[str, DecisionRecord]]:
+        """All decisions as (tool_call_id, record), oldest first (pages through the store)."""
+        found, offset = [], 0
+        while items := self.store.search(self.namespace, limit=100, offset=offset):
+            found += [(item.key, item.value) for item in items]
+            offset += len(items)
+        return sorted(found, key=lambda kv: kv[1]["decided_at"])  # type: ignore[return-value]
+
+    def delete(self, tool_call_id: str) -> None:
+        self.store.delete(self.namespace, tool_call_id)
 
     def clear(self) -> int:
         removed = 0
