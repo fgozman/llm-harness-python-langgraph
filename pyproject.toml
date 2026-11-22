@@ -42,7 +42,15 @@ filterwarnings = [
     "ignore:The default datetime adapter is deprecated:DeprecationWarning:langgraph.store.sqlite",
 ]
 
+[tool.ruff]
+# Ruff's default rule set changes between minor versions, so the dev dependency is
+# pinned to 0.17.x: everyone (and CI) gets the same checks.
+target-version = "py312"
+line-length = 120  # the code base wraps at ~110; E501 is not in the default rules
+src = ["src", "tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
+    "ruff>=0.17.6,<0.18",
 ]

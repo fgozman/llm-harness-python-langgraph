@@ -10,6 +10,7 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 
 from file_organizer.persistence import PruningSqliteSaver
 from file_organizer.workspace import Workspace
@@ -47,20 +48,20 @@ class ScriptedChatModel(BaseChatModel):
     """
 
     responses: list[AIMessage]
-    received: list[list[BaseMessage]] = []
-    bound_tools: list[Any] = []
+    received: list[list[BaseMessage]] = Field(default_factory=list)
+    bound_tools: list[Any] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
         return "scripted"
 
-    def bind_tools(self, tools, **kwargs):  # noqa: ANN001
+    def bind_tools(self, tools, **kwargs):
         # build_graph calls this to advertise the tools; a real model would return a
         # wrapped runnable. Here we just record the tools so tests can check them.
         self.bound_tools = list(tools)
         return self
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         # The one method a BaseChatModel must implement: messages in, ChatResult out.
         self.received.append(list(messages))
         if not self.responses:

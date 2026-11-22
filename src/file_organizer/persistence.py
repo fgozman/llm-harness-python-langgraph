@@ -20,9 +20,10 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from langgraph.checkpoint.sqlite import SqliteSaver  # separate package: langgraph-checkpoint-sqlite
+# SqliteSaver and SqliteStore come from a separate package: langgraph-checkpoint-sqlite
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.base import TTLConfig
-from langgraph.store.sqlite import SqliteStore  # same package
+from langgraph.store.sqlite import SqliteStore
 
 log = logging.getLogger(__name__)
 

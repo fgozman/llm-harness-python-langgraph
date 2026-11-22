@@ -371,7 +371,11 @@ with sqlite_checkpointer("state.sqlite") as checkpointer, sqlite_store("state.sq
 
 ```bash
 uv run pytest
+uv run ruff check src tests        # lint (add --fix for the auto-fixable ones)
 ```
+
+Ruff is pinned to 0.17.x in the dev group, because its default rule set changes
+between minor versions; its settings are under `[tool.ruff]` in `pyproject.toml`.
 
 The tests use a scripted fake chat model (`tests/conftest.py`), so they're deterministic
 and don't call any LLM. They cover:

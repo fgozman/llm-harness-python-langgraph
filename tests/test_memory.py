@@ -217,7 +217,7 @@ class EchoSummarizer(BaseChatModel):
     def _llm_type(self) -> str:
         return "echo"
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls += 1
         markers = sorted(set(re.findall(r"body-of-f\d+", str(messages[-1].content))))
         return ChatResult(generations=[ChatGeneration(message=AIMessage("NOTES read: " + ", ".join(markers)))])
