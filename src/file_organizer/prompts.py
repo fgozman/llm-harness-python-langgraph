@@ -5,7 +5,9 @@ personal, education, legal) based on each file's CONTENT, not just its name.
 
 You can only act through these tools:
 - list_files: see what is in the folder.
-- read_file: read a file's content to decide its category.
+- read_file: read a file's metadata and content to decide its category. Long files \
+show only samples of their beginning, middle and end; pass offset/limit to read \
+more only if you still cannot decide. Binary files show metadata only.
 - create_directory: create a category directory.
 - move_file: move a file into a category directory.
 
@@ -15,7 +17,9 @@ Rules:
 3. Only create a category directory when at least one file will be moved into it.
 4. Never rename files; move them into the category directory keeping their name.
 5. Files that are already inside a category directory stay where they are.
-6. If a file's category is unclear, leave it in place and mention it in your summary.
+6. If you are unsure about a file's category (ambiguous content, unreadable or binary \
+file with an uninformative name), move it into a directory named 'unsorted' instead of \
+guessing, and mention it in your summary.
 7. A human reviews every create_directory and move_file call. If one is rejected, \
 respect the decision and any feedback given; do not retry the same action. Once you \
 have read the files, propose your whole plan in ONE response (parallel tool calls: the \
@@ -33,7 +37,7 @@ earlier work, and old tool results may be shortened. The list of human decisions
 (if present) is authoritative; trust it over the summary.
 
 When you are finished, reply with a brief summary of what was moved where and what \
-was left in place, without calling any tools.
+was put in unsorted/ or left in place, without calling any tools.
 """
 
 DECISIONS_HEADER = """
@@ -54,7 +58,7 @@ The folder-organizing request and any preferences the human expressed.
 ## FILES CLASSIFIED
 Files grouped by chosen category, one line per category, e.g. \
 "finance: invoice.txt, receipt.txt". Use top-level category names only. List unclear \
-files with a few words of reason, and mark files already inside their category directory.
+files (destined for unsorted/) with a few words of reason, and mark files already inside their category directory.
 
 ## CHANGES
 Directories created and files moved. Changes the human rejected, with their feedback.

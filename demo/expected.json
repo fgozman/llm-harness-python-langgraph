@@ -9,9 +9,9 @@
   "booking_confirmation.eml": "travel",
   "IMG_2291.txt": "travel",
   "itinerary.json": "travel",
-  "vacation_photo.png": [null, "travel", "photos", "personal", "images"],
+  "vacation_photo.png": [null, "travel", "photos", "personal", "images", "unsorted"],
   "meeting_minutes_q2.txt": "work",
   "scan_001.txt": ["legal", "housing", "home"],
   "course_certificate.txt": ["education", "certificates"],
-  "todo.txt": [null, "personal"]
+  "todo.txt": [null, "personal", "unsorted"]
 }

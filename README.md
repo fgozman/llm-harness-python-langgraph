@@ -8,7 +8,7 @@ and **every change to the filesystem is approved by a human first**.
 ## Quick start
 
 ```bash
-uv sync --extra anthropic          # or: --extra openai
+uv sync --extra anthropic          # or: --extra openai; add --extra documents for PDF text and image EXIF
 # put your API key (and optionally the model) in .env, see .env.example
 uv run file-organizer ~/Downloads/inbox
 uv run file-organizer ~/Downloads/inbox --model openai:gpt-4.1   # any init_chat_model id
@@ -307,7 +307,7 @@ uv run python demo/demo.py check      # compare the result with demo/expected.js
 ```
 
 The 14 sample files include tricky cases: misleading names, a binary file, a long
-(truncated) file, an existing `finance/` folder, a hidden file, and an ambiguous file.
+(truncated) file, an existing `finance/` folder, a hidden file, and an ambiguous file (which the agent should move to `unsorted/`).
 See [`demo/README.md`](demo/README.md).
 
 ## Architecture
@@ -321,7 +321,8 @@ START → summarize → agent ──(no tool calls)──▶ END
 
 | Module | Responsibility |
 |---|---|
-| `workspace.py` | Filesystem operations sandboxed to the target folder. It rejects `..`, absolute paths, and symlink escapes. It moves files only into existing directories and never overwrites; it renames only with `rename_on_clash` (to a free `name (2).ext`). Each change reports how to undo it (`Change.undo`), and `undo_move()`/`remove_empty_directory()` reverse it. It truncates long files and doesn't dump binary files. |
+| `workspace.py` | Filesystem operations sandboxed to the target folder. It rejects `..`, absolute paths, and symlink escapes. It moves files only into existing directories and never overwrites; it renames only with `rename_on_clash` (to a free `name (2).ext`). Each change reports how to undo it (`Change.undo`), and `undo_move()`/`remove_empty_directory()` reverse it. `read_file` returns metadata first (name, extension, MIME type, size, mtime), then content by format, detected from the file's first bytes: text, PDF/DOCX text, a CSV's header and first 5 rows, image EXIF; other binary files get metadata only. Long text shows ~2K characters each from its beginning, middle and end, with truncation markers between them; `offset`/`limit` page through the rest. Reads are bounded (`max_read_chars` per call, `max_parse_bytes` per document or paging scan). |
+| `extract.py` | Format detection and the bounded extractors used by `read_file`. DOCX uses the standard library (DTDs refused, zip-bomb cap). PDF (`pypdf`) and EXIF (`pillow`) come from the optional `documents` extra; without it those files get metadata and a hint. |
 | `tools.py` | Wraps the workspace as LangChain tools; each function's docstring becomes the tool description. `WorkspaceError` is a `ToolException`, so errors are sent back to the model as `Error: …` tool results. `read_file` wraps content in tags with a random id per read (`wrap_file_content`). The changing tools return their undo information as the ToolMessage's `artifact`, which the model never sees. `MUTATING_TOOLS = {create_directory, move_file}`. |
 | `graph.py` | The LangGraph `StateGraph` (state schema, nodes, wiring), compiled with a checkpointer (required) and a store. `summarize` shrinks the history when needed. `agent` calls the LLM with the decision log in the system prompt and a trimmed request. `review` calls `interrupt()` once for each mutating tool call (each payload also lists the whole batch, for the plan) and does nothing else, so LangGraph can safely re-run it on resume. `tools` runs read-only calls and approved changes; for rejected changes it returns a `Rejected by the user …` message, including any feedback. It then writes the final decisions, with their undo information, to the store. |
 | `memory.py` | Context management: `ContextPolicy` (limits), the summarize node (wrapping `SummarizationMiddleware`), `fit_context()` (trimming safety net), and `DecisionLog` (finalized decisions in the store). |
@@ -380,6 +381,7 @@ between minor versions; its settings are under `[tool.ruff]` in `pyproject.toml`
 The tests use a scripted fake chat model (`tests/conftest.py`), so they're deterministic
 and don't call any LLM. They cover:
 - `test_workspace.py`: sandbox and filesystem semantics
+- `test_read_file.py`: `read_file` metadata, per-format extraction (PDF, DOCX, CSV, EXIF, binary), head/tail truncation, `offset`/`limit` paging, the byte caps, and the fallbacks for missing libraries or corrupt files
 - `test_tools.py`: the tool surface and error handling
 - `test_graph.py`: the agent loop, interrupts, approval and rejection, batches, a full session, the required checkpointer, and reopening the SQLite file. Graph tests use the real `SqliteSaver` on an in-memory SQLite database.
 - `test_cli.py`: prompt parsing, the batch plan and "approve all remaining", a full interactive session, Ctrl-C, the entry point, and the `--recursion-limit`/`--rename-on-clash` options

@@ -40,8 +40,10 @@ def test_sample_exercises_edge_cases():
     listing = ws.list_files()
     assert "finance/" in listing  # pre-existing category
     assert not any(name.startswith(".") for name in listing)  # hidden file skipped
-    assert ws.read_file("vacation_photo.png").startswith("[binary file")
+    photo = ws.read_file("vacation_photo.png")
+    assert "mime type: image/png" in photo and "image metadata" in photo  # no pixel dump
     assert "truncated" in ws.read_file("tax_return_2023.txt")
+    assert "first 5 rows" in ws.read_file("bank_statement_march.csv")
 
 
 def test_reset_then_check_reports_unorganized_inbox(demo, capsys):

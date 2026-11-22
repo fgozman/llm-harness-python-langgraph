@@ -7,21 +7,32 @@ rejected if it resolves (symlinks included) to a location outside of it.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from collections.abc import Collection
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from langchain_core.tools import ToolException
 
+from . import extract
+
 log = logging.getLogger(__name__)
 
-DEFAULT_MAX_READ_CHARS = 4_000
+#: Characters of content returned per read_file call. By default a third of this is shown
+#: from the beginning, the middle and the end of long text (~2K each); offset/limit pages
+#: through the rest, at most this many characters at a time.
+DEFAULT_MAX_READ_CHARS = 6_000
+#: Documents (PDF/DOCX) larger than this are not parsed, and paging through a text file
+#: never reads more than this many bytes of it.
+DEFAULT_MAX_PARSE_BYTES = 32 * 1024 * 1024
+#: Text extracted from a document at most (what offset/limit can page through).
+MAX_EXTRACT_CHARS = 1_000_000
 DEFAULT_MAX_LIST_ENTRIES = 500
 MAX_DIRECTORY_DEPTH = 3  # how deep create_directory may nest category folders
 MAX_PATH_CHARS = 1_024
 MAX_RENAME_ATTEMPTS = 1_000  # "name (2).txt" ... "name (1000).txt"
-_BINARY_SNIFF_BYTES = 1_024
 
 
 class Change(NamedTuple):
@@ -53,6 +64,7 @@ class Workspace:
         *,
         max_read_chars: int = DEFAULT_MAX_READ_CHARS,
         max_list_entries: int = DEFAULT_MAX_LIST_ENTRIES,
+        max_parse_bytes: int = DEFAULT_MAX_PARSE_BYTES,
         rename_on_clash: bool = False,
     ):
         """``rename_on_clash``: when a file with the same name is already in the destination
@@ -66,6 +78,7 @@ class Workspace:
         self.root = root.resolve()
         self.max_read_chars = max_read_chars
         self.max_list_entries = max_list_entries
+        self.max_parse_bytes = max_parse_bytes
         self.rename_on_clash = rename_on_clash
 
     # ------------------------------------------------------------------ helpers
@@ -115,30 +128,161 @@ class Workspace:
             listing.append(f"[... {len(entries) - self.max_list_entries} more entries not shown]")
         return listing
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        """Metadata of a file, then (a bounded part of) its content.
+
+        Always first: name, extension, MIME type, size and modification time. Then, by
+        format: the text of PDF/DOCX files, the header and first rows of a CSV, the EXIF
+        tags of an image, the text of a text file; other binary files get metadata only.
+
+        Without ``offset``/``limit``, text longer than ``max_read_chars`` is shown as its
+        beginning, middle and end (a third each), with truncation markers in between. With them, characters
+        ``[offset, offset + limit)`` of the text are returned (limit is capped at
+        ``max_read_chars``); for a CSV this pages through its raw text.
+        """
+        if offset is not None and offset < 0:
+            raise WorkspaceError("offset must be 0 or more.")
+        if limit is not None and limit < 1:
+            raise WorkspaceError("limit must be 1 or more.")
         target = self._resolve(path)
         if not target.exists():
             raise WorkspaceError(f"File '{path}' not found.")
         if not target.is_file():
             raise WorkspaceError(f"'{path}' is not a file.")
 
+        stat = target.stat()
         with target.open("rb") as fh:
-            head = fh.read(_BINARY_SNIFF_BYTES)
-        if b"\x00" in head:
-            size = target.stat().st_size
-            return (
-                f"[binary file '{self._rel(target)}', {size} bytes - content not shown; "
-                "classify it by its name and extension]"
-            )
+            head = fh.read(extract.SNIFF_BYTES)
+        kind, mime = extract.detect(target, head)
+        metadata = "\n".join([
+            "[metadata]",
+            f"name: {extract.one_line(target.name, 255)}",
+            f"extension: {extract.one_line(target.suffix) or '(none)'}",
+            f"mime type: {mime}",
+            f"size: {stat.st_size} bytes",
+            f"modified: {datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(timespec='seconds')}",
+        ])
+        paging = offset is not None or limit is not None
+        page = (offset or 0, min(limit or self.max_read_chars, self.max_read_chars))
+        try:
+            body = self._content(target, kind, stat.st_size, page if paging else None)
+        except extract.ExtractionError as exc:
+            body = f"[content: not available - {exc}; classify the file by its metadata]"
+        if paging and limit is not None and limit > self.max_read_chars:
+            body += f"\n[limit was capped at {self.max_read_chars} characters per read]"
+        return f"{metadata}\n{body}"
 
-        # Read a bounded prefix only (UTF-8 is at most 4 bytes per char), never the whole file.
-        size = target.stat().st_size
+    # ------------------------------------------------------- read_file content
+    def _content(self, target: Path, kind: str, size: int, page: tuple[int, int] | None) -> str:
+        if kind == "binary":
+            return "[content: none - binary file; classify it by its name, extension and metadata]"
+        if kind == "image":
+            lines = extract.image_details(target)
+            if page:
+                lines.append("[offset/limit ignored: an image has no text to page through]")
+            return "[content: image metadata]\n" + "\n".join(lines)
+        if kind in ("pdf", "docx"):
+            if size > self.max_parse_bytes:
+                raise extract.ExtractionError(
+                    f"the document is larger than {self.max_parse_bytes} bytes, so it was not parsed")
+            extractor = extract.pdf_text if kind == "pdf" else extract.docx_text
+            text, details, cut = extractor(target, MAX_EXTRACT_CHARS)
+            label = f"{kind.upper()} text" + (f" (extraction stopped after {len(text)} characters)" if cut else "")
+            prefix = "".join(line + "\n" for line in details)
+            if not text.strip():
+                return prefix + f"[content: {kind.upper()} has no extractable text (e.g. a scan)]"
+            return prefix + self._view(text, page, label)
+        if kind == "csv" and page is None:
+            return self._csv_preview(target, size)
+        return self._text(target, size, page)
+
+    def _view(self, text: str, page: tuple[int, int] | None, label: str) -> str:
+        """Default head/tail view or one page of an in-memory text."""
+        total = len(text)
+        if page is not None:
+            offset, limit = page
+            if offset > 0 and offset >= total:
+                return f"[content: {label}; offset {offset} is past the end ({total} characters)]"
+            end = min(offset + limit, total)
+            more = f"more follows, next offset={end}" if end < total else "end of text"
+            return f"[content: {label}, characters {offset}-{end} of {total}; {more}]\n{text[offset:end]}"
+        if total <= self.max_read_chars:
+            return f"[content: {label}, {total} characters]\n{text}"
+        head, mid, tail = self._thirds()
+        m0 = (total - mid) // 2  # the middle sample is centred in the text
+        m1, t0 = m0 + mid, total - tail
+        return (
+            f"[content: {label}, {total} characters; showing characters 0-{head}, {m0}-{m1} "
+            f"and {t0}-{total}]\n"
+            f"{text[:head]}\n{self._marker(f'characters {head}-{m0}', head)}\n"
+            f"{text[m0:m1]}\n{self._marker(f'characters {m1}-{t0}', m1)}\n{text[t0:]}"
+        )
+
+    def _thirds(self) -> tuple[int, int, int]:
+        """How many characters of the beginning, middle and end the default view shows."""
+        part = max(1, self.max_read_chars // 3)
+        return max(1, self.max_read_chars - 2 * part), part, part
+
+    @staticmethod
+    def _marker(omitted: str, next_offset: int | None) -> str:
+        how = (f"Call read_file with offset={next_offset} (and optionally limit) to read them"
+               if next_offset is not None else "Page with read_file offset/limit to read them")
+        return f"[... truncated: {omitted} omitted. {how} ...]"
+
+    def _text(self, target: Path, size: int, page: tuple[int, int] | None) -> str:
+        """A UTF-8 text file. Never reads the whole file: the default view reads at most
+        ``max_read_chars * 4`` bytes (UTF-8 is at most 4 bytes per character); paging
+        decodes from the start up to ``max_parse_bytes`` bytes."""
+        cap = self.max_read_chars * 4
+        if page is None and size > cap:  # large file: read the beginning, the middle and the end
+            head_chars, mid_chars, tail_chars = self._thirds()
+            chunk_start = size // 2 - mid_chars * 2  # a chunk centred in the file
+            with target.open("rb") as fh:
+                head = fh.read(head_chars * 4).decode("utf-8", errors="replace")[:head_chars]
+                fh.seek(chunk_start)
+                chunk = fh.read(mid_chars * 4)
+                fh.seek(-tail_chars * 4, os.SEEK_END)
+                tail = extract.decode_tail(fh.read())[-tail_chars:]
+            # Keep the characters at the centre of the chunk (its ends may hold split characters).
+            decoded = extract.decode_tail(chunk)
+            skip = (len(decoded) - mid_chars) // 2
+            mid = decoded[skip:skip + mid_chars]
+            mid_start = chunk_start + (len(chunk) - len(decoded[skip:].encode("utf-8")))
+            mid_end = mid_start + len(mid.encode("utf-8"))
+            # Character offsets of the middle and end are unknown without decoding the whole
+            # file, so the markers give byte positions (equal to characters for ASCII text).
+            return (
+                f"[content: text, {size} bytes; showing the first {len(head)} characters, "
+                f"{len(mid)} from about byte {mid_start} and the last {len(tail)}]\n"
+                f"{head}\n{self._marker(f'the text from character {len(head)} to about byte {mid_start}', len(head))}\n"
+                f"{mid}\n{self._marker(f'the text from about byte {mid_end} to the last part', None)}\n{tail}"
+            )
+        if page is None or size <= cap:
+            with target.open("rb") as fh:
+                text = fh.read(cap).decode("utf-8", errors="replace")
+            return self._view(text, page, "text")
+        offset, limit = page
+        text, more, hit_cap = extract.stream_slice(target, offset, limit, self.max_parse_bytes)
+        if not text and not more:
+            return f"[content: text; offset {offset} is past the end of the file]"
+        if hit_cap and len(text) < limit:
+            note = f"paging stops after the first {self.max_parse_bytes} bytes of the file"
+        else:
+            note = f"more follows, next offset={offset + len(text)}" if more else "end of file"
+        return f"[content: text, characters {offset}-{offset + len(text)}; {note}]\n{text}"
+
+    def _csv_preview(self, target: Path, size: int) -> str:
+        cap = self.max_read_chars * 4
         with target.open("rb") as fh:
-            raw = fh.read(self.max_read_chars * 4)
-        text = raw.decode("utf-8", errors="replace")
-        if len(text) > self.max_read_chars or len(raw) < size:
-            text = text[: self.max_read_chars] + f"\n[... truncated, file is {size} bytes]"
-        return text
+            raw = fh.read(cap)
+        preview, more = extract.csv_preview(
+            raw.decode("utf-8", errors="replace"), complete=len(raw) >= size,
+            tsv=target.suffix.lower() == ".tsv")
+        if len(preview) > self.max_read_chars:
+            preview = preview[: self.max_read_chars] + "\n[... preview truncated]"
+        footer = ("\n[... more rows follow; call read_file with offset/limit to page through the raw text]"
+                  if more else "")
+        return f"[content: CSV header and first {extract.CSV_PREVIEW_ROWS} rows]\n{preview.rstrip()}{footer}"
 
     def create_directory_change(self, path: str) -> Change:
         target = self._resolve(path)

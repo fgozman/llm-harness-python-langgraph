@@ -78,11 +78,15 @@ def make_tools(workspace: Workspace) -> list[BaseTool]:
         entries = workspace.list_files(directory)
         return "\n".join(entries) if entries else f"(directory '{directory}' is empty)"
 
-    def read_file(path: str) -> str:
-        """Read the text content of a file (relative path). Long files are truncated;
-        binary files are reported as such."""
+    def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+        """Read a file (relative path). Returns its metadata (name, extension, MIME type,
+        size, modification time) first, then its content: text of text/PDF/DOCX files,
+        the header and first 5 rows of a CSV, EXIF tags of an image; other binary files
+        get metadata only. Long text shows only samples of its beginning, middle and
+        end; to read more, pass offset (character position to start at) and optionally
+        limit (characters to return, capped per call)."""
         # Delimit the content so the model can tell untrusted file data from instructions.
-        return wrap_file_content(path, workspace.read_file(path))
+        return wrap_file_content(path, workspace.read_file(path, offset, limit))
 
     def create_directory(path: str) -> tuple[str, dict[str, Any] | None]:
         """Create a directory (relative path, parents included). Requires human approval."""

@@ -21,11 +21,11 @@ uv run python demo/demo.py check      # compare the result with demo/expected.js
 | `lab_results.md` | health | markdown table |
 | `IMG_2291.txt` | travel | **misleading name**: a boarding pass, not an image |
 | `booking_confirmation.eml`, `itinerary.json` | travel | email and JSON formats |
-| `vacation_photo.png` | travel / photos / left in place | **binary** file, has to be classified by its name alone |
+| `vacation_photo.png` | travel / photos / unsorted / left in place | **image**: classified by its name and metadata (EXIF) |
 | `meeting_minutes_q2.txt` | work | |
 | `scan_001.txt` | legal / housing | **misleading name**: a lease agreement |
 | `course_certificate.txt` | education | |
-| `todo.txt` | left in place (or personal) | **ambiguous**: the agent should leave it and say so |
+| `todo.txt` | unsorted (or personal / left in place) | **ambiguous**: the agent should move it to `unsorted/` and say so |
 | `.hidden_metadata` | — | hidden files are never listed |
 
 Things to try during the run: reject a move with feedback (e.g. `no, put leases under housing`)

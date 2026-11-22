@@ -51,21 +51,20 @@ class TestListFiles:
 
 class TestReadFile:
     def test_reads_text(self, ws: Workspace):
-        assert ws.read_file("invoice.txt") == "Invoice #42: total due 120 EUR"
+        assert ws.read_file("invoice.txt").endswith("\nInvoice #42: total due 120 EUR")
 
     def test_truncates_long_files(self, root: Path):
         (root / "long.txt").write_text("a" * 100)
         ws = Workspace(root, max_read_chars=10)
         content = ws.read_file("long.txt")
-        assert content.startswith("a" * 10)
         assert "truncated" in content
-        assert "a" * 11 not in content
+        assert "a" * 5 not in content  # 4 + 3 + 3 characters from the beginning, middle and end
 
     def test_binary_files_are_not_dumped(self, ws: Workspace, root: Path):
-        (root / "photo.jpg").write_bytes(b"\xff\xd8\xff\x00\x10JFIF\x00")
-        content = ws.read_file("photo.jpg")
+        (root / "blob.dat").write_bytes(b"\x00\x01secret\x00")
+        content = ws.read_file("blob.dat")
         assert "binary" in content.lower()
-        assert "photo.jpg" in content
+        assert "blob.dat" in content and "secret" not in content
 
     def test_reading_a_directory_raises(self, ws: Workspace):
         with pytest.raises(WorkspaceError, match="not a file"):
@@ -189,7 +188,8 @@ class TestGuardrails:
     def test_read_is_bounded(self, root: Path):
         (root / "big.txt").write_text("a" * 100_000)
         text = Workspace(root, max_read_chars=10).read_file("big.txt")
-        assert text.startswith("a" * 10) and "truncated" in text and len(text) < 100
+        content = text.split("[content:", 1)[1]
+        assert content.count("truncated") == 2 and "a" * 5 not in content and len(content) < 500
 
     def test_listing_is_capped(self, root: Path):
         listing = Workspace(root, max_list_entries=1).list_files()
