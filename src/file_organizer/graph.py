@@ -226,12 +226,18 @@ def build_graph(
         decisions = {}
         changes = [tc for tc in tool_calls(state) if tc["name"] in MUTATING_TOOLS]
         # The whole batch goes with every question, so the caller can show the full
-        # plan before the first answer (and offer "approve all remaining").
-        batch = [{"tool_call_id": tc["id"], "description": describe(tc["name"], tc["args"])}
-                 for tc in changes]
+        # plan before the first answer (and offer "approve all remaining"). The plan
+        # assumes every change is approved, which is what "approve all" does.
+        batch = []
         claimed: set[str] = set()  # destinations of earlier approved moves of this batch
+        gone: set[str] = set()  # their sources, and the directories they leave empty
+        for tc in changes:
+            planned, emptied = _move_effects(tc, claimed, gone)
+            batch.append({"tool_call_id": tc["id"], "description": _describe(tc, planned, emptied)})
+            _claim(tc, planned, emptied, claimed, gone)
+        claimed, gone = set(), set()
         for index, tc in enumerate(changes):
-            planned = _planned_move(tc, claimed)
+            planned, emptied = _move_effects(tc, claimed, gone)
             # Pauses the run and shows this dict to the caller, who later resumes
             # with Command(resume=answer); interrupt() then returns that answer.
             # The payload must be serializable: it is stored in the checkpoint.
@@ -240,15 +246,46 @@ def build_graph(
                     "tool_call_id": tc["id"],
                     "tool": tc["name"],
                     "args": tc["args"],
-                    "description": describe(tc["name"], tc["args"]) + _clash_note(tc, planned),
+                    "description": _describe(tc, planned, emptied),
                     "index": index,
                     "batch": batch,
                 }
             )
-            decisions[tc["id"]] = parse_decision(answer)
-            if planned is not None and decisions[tc["id"]]["approved"]:
-                claimed.add(planned)
+            decision = parse_decision(answer)
+            if decision["approved"]:
+                _claim(tc, planned, emptied, claimed, gone)
+                if emptied:
+                    decision["remove_dirs"] = emptied
+            decisions[tc["id"]] = decision
         return {"decisions": decisions}
+
+    def _move_effects(tc: dict[str, Any], claimed: set[str],
+                      gone: set[str]) -> tuple[str | None, list[str]]:
+        """For a move_file call: where the file will land and which directories it will
+        leave empty, after the earlier approved moves of the batch (``claimed``, ``gone``).
+        (None, []) if it is not a move or would fail. Read-only, so safe in review."""
+        planned = _planned_move(tc, claimed)
+        if planned is None:
+            return None, []
+        # The move's own destination counts too: moving into an ancestor keeps it non-empty.
+        return planned, workspace.emptied_directories(tc["args"]["source"], gone, [*claimed, planned])
+
+    def _claim(tc: dict[str, Any], planned: str | None, emptied: list[str],
+               claimed: set[str], gone: set[str]) -> None:
+        """Count an approved move's effects for the batch's later moves."""
+        if planned is not None:
+            claimed.add(planned)
+            gone.update([tc["args"]["source"], *emptied])
+
+    def _describe(tc: dict[str, Any], planned: str | None, emptied: list[str]) -> str:
+        return describe(tc["name"], tc["args"]) + _clash_note(tc, planned) + _removal_note(emptied)
+
+    def _removal_note(emptied: list[str]) -> str:
+        """Tell the human which directories the move will remove because it empties them."""
+        if not emptied:
+            return ""
+        return " (then removes the emptied director{} {})".format(
+            "y" if len(emptied) == 1 else "ies", ", ".join(f"'{_safe(d)}'" for d in emptied))
 
     def _planned_move(tc: dict[str, Any], claimed: set[str]) -> str | None:
         """Where an approved move_file call will put the file (relative path), counting
@@ -269,6 +306,18 @@ def build_graph(
         if planned.rsplit("/", 1)[-1] == tc["args"]["source"].rsplit("/", 1)[-1]:
             return ""
         return f" (name taken there; will be saved as '{_safe(planned)}')"
+
+    def _remove_emptied(result: ToolMessage, paths: list[str]) -> None:
+        """After an applied move, remove the emptied directories the human approved with
+        it; report the outcome in the result and record the removals for undo."""
+        removed, problem = workspace.remove_emptied_directories(paths)
+        if removed:
+            result.content += " Removed the now-empty director{} {}.".format(
+                "y" if len(removed) == 1 else "ies", ", ".join(f"'{d}'" for d in removed))
+            result.artifact = {**result.artifact, "removed": removed}
+        if problem:
+            log.warning("Directory cleanup after a move stopped: %s", problem)
+            result.content += f" Directory cleanup stopped: {problem}."
 
     def run_tools(state: AgentState, runtime: Runtime) -> dict[str, Any]:
         """Node: execute the tool calls (what langgraph.prebuilt.ToolNode does, plus the
@@ -297,6 +346,8 @@ def build_graph(
             else:
                 # Invoking with the whole tool call returns a ready-made ToolMessage.
                 result = tools[name].invoke(tc)
+                if result.status != "error" and decision.get("remove_dirs"):
+                    _remove_emptied(result, decision["remove_dirs"])
             results.append(result)
 
             if name in MUTATING_TOOLS:

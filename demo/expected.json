@@ -1,5 +1,5 @@
 {
-  "_comment": "Acceptable final location (category dir) per file, relative to the inbox. null = left in place (top level). Arrays list all acceptable answers.",
+  "_comment": "Acceptable final location (category dir) per file, relative to the inbox. null = left in place (top level). Arrays list all acceptable answers. Downloads/ is not a category: its files must be sorted too.",
   "invoice_2024_031.txt": "finance",
   "bank_statement_march.csv": "finance",
   "tax_return_2023.txt": ["finance", "taxes", "tax", "legal"],
@@ -13,5 +13,17 @@
   "meeting_minutes_q2.txt": "work",
   "scan_001.txt": ["legal", "housing", "home"],
   "course_certificate.txt": ["education", "certificates"],
-  "todo.txt": [null, "personal", "unsorted"]
+  "todo.txt": [null, "personal", "unsorted"],
+  "electricity_bill_feb_2024.pdf": ["finance", "bills", "utilities", "housing", "home"],
+  "cv_leo_gozman.docx": ["work", "career", "personal", "jobs"],
+  "policy_documents.doc": ["insurance", "finance", "car", "vehicle", "legal"],
+  "budget_2024.xlsx": ["finance", "budget"],
+  "onboarding.ppt": "work",
+  "IMG_4410.jpg": ["travel", "photos", "images", "personal"],
+  "Downloads/scan0003.pdf": ["health", "medical"],
+  "Downloads/attachment (1).docx": ["housing", "legal", "home", "finance"],
+  "Downloads/team_offsite.xls": "work",
+  "Downloads/old stuff/Document1.doc": "education",
+  "Downloads/old stuff/presentation.ppt": "education",
+  "Downloads/old stuff/export.xlsx": ["health", "medical"]
 }

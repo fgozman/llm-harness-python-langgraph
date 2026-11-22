@@ -4,7 +4,8 @@ Every applied change is recorded with an ``undo`` entry (see ``workspace.Change`
 a move remembers where the file came from, a new directory which directories it
 created. Undoing walks those records newest first:
 
-* a moved file goes back to its original path (never overwriting anything there);
+* a moved file goes back to its original path (never overwriting anything there),
+  recreating the directories the move removed because it left them empty;
 * a created directory is removed only if it is empty again (anything put there since,
   even a hidden file, keeps it).
 
@@ -32,7 +33,8 @@ class UndoStep:
     key: str
     description: str
     op: str  # "move" or "rmdir"
-    paths: tuple[str, ...]  # move: (current path, original path); rmdir: (directory,)
+    # move: (current path, original path, *directories to recreate); rmdir: (directory,)
+    paths: tuple[str, ...]
 
 
 def plan_undo(entries: list[tuple[str, DecisionRecord]]) -> tuple[list[UndoStep], list[str]]:
@@ -54,7 +56,7 @@ def plan_undo(entries: list[tuple[str, DecisionRecord]]) -> tuple[list[UndoStep]
             unknown.append(key)
         elif undo.get("op") == "move":
             steps.append(UndoStep(key, f"Move '{_safe(undo['to'])}' back to '{_safe(undo['from'])}'",
-                                  "move", (undo["to"], undo["from"])))
+                                  "move", (undo["to"], undo["from"], *undo.get("removed", ()))))
         elif undo.get("op") == "mkdir":
             for path in reversed(undo["paths"]):
                 steps.append(UndoStep(key, f"Remove directory '{_safe(path)}' (if empty)", "rmdir", (path,)))
@@ -66,7 +68,8 @@ def plan_undo(entries: list[tuple[str, DecisionRecord]]) -> tuple[list[UndoStep]
 def apply_step(workspace: Workspace, step: UndoStep) -> str:
     """Apply one undo step; raises WorkspaceError if it can't be done safely."""
     if step.op == "move":
-        return workspace.undo_move(*step.paths)
+        moved_to, original, *removed = step.paths
+        return workspace.undo_move(moved_to, original, removed)
     return workspace.remove_empty_directory(step.paths[0])
 
 

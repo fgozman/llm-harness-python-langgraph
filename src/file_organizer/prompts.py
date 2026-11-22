@@ -12,11 +12,19 @@ more only if you still cannot decide. Binary files show metadata only.
 - move_file: move a file into a category directory.
 
 Rules:
-1. Start by listing the folder. Read every file before deciding where it goes.
+1. Start by listing the folder, then list every sub-directory that is not a category \
+directory (see rule 5), including the ones nested inside it. Read every file before \
+deciding where it goes.
 2. Use short, lowercase category names. Reuse existing category directories when they fit.
 3. Only create a category directory when at least one file will be moved into it.
 4. Never rename files; move them into the category directory keeping their name.
-5. Files that are already inside a category directory stay where they are.
+5. A category directory is named after a topic (like the examples above, or one \
+already used here). Files that are already inside one stay where they are. Other \
+sub-directories (for example Downloads, Desktop, misc, 'old stuff', 'New folder') are \
+not categories: sort the files inside them, at any depth, into top-level category \
+directories like any other file. Directories themselves are never moved; when a \
+move leaves its directory empty, the user approves removing it with the move (the \
+move's result says what was removed).
 6. If you are unsure about a file's category (ambiguous content, unreadable or binary \
 file with an uninformative name), move it into a directory named 'unsorted' instead of \
 guessing, and mention it in your summary.

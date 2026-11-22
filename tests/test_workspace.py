@@ -259,6 +259,70 @@ class TestUndoSupport:
         with pytest.raises(WorkspaceError, match="outside"):
             ws.undo_move("invoice.txt", "../stolen.txt")
 
+    def test_emptied_directories_counts_the_batch_and_changes_nothing(self, ws: Workspace, root: Path):
+        (root / "Downloads" / "old stuff").mkdir(parents=True)
+        (root / "Downloads" / "old stuff" / "a.txt").write_text("a")
+        (root / "Downloads" / "b.txt").write_text("b")
+        assert ws.emptied_directories("Downloads/old stuff/a.txt") == ["Downloads/old stuff"]
+        assert ws.emptied_directories("Downloads/b.txt") == []  # old stuff/ is still there
+        gone = ["Downloads/old stuff/a.txt", "Downloads/old stuff"]
+        assert ws.emptied_directories("Downloads/b.txt", gone) == ["Downloads"]
+        # A file an earlier move of the batch puts there keeps the directory.
+        assert ws.emptied_directories("Downloads/b.txt", gone, ["Downloads/x.txt"]) == []
+        assert ws.emptied_directories("invoice.txt") == []  # the root is never removed
+        assert (root / "Downloads" / "old stuff" / "a.txt").exists()
+
+    def test_moving_into_an_ancestor_keeps_it(self, ws: Workspace, root: Path):
+        (root / "work" / "old").mkdir(parents=True)
+        (root / "work" / "old" / "a.txt").write_text("a")
+        planned = ws.planned_destination("work/old/a.txt", "work")
+        assert ws.emptied_directories("work/old/a.txt", (), [planned]) == ["work/old"]
+
+    def test_emptied_directories_counts_hidden_files(self, ws: Workspace, root: Path):
+        (root / "Downloads").mkdir()
+        (root / "Downloads" / "a.txt").write_text("a")
+        (root / "Downloads" / ".DS_Store").write_text("")
+        assert ws.emptied_directories("Downloads/a.txt") == []
+
+    def test_move_no_longer_removes_directories_by_itself(self, ws: Workspace, root: Path):
+        (root / "Downloads").mkdir()
+        (root / "Downloads" / "a.txt").write_text("a")
+        change = ws.move_file_change("Downloads/a.txt", "docs")
+        assert (root / "Downloads").is_dir() and "removed" not in change.undo
+
+    def test_remove_emptied_directories_and_undo(self, ws: Workspace, root: Path):
+        (root / "Downloads" / "old stuff").mkdir(parents=True)
+        (root / "Downloads" / "old stuff" / "a.txt").write_text("a")
+        ws.move_file_change("Downloads/old stuff/a.txt", "docs")
+        removed, problem = ws.remove_emptied_directories(["Downloads/old stuff", "Downloads"])
+        assert (removed, problem) == (["Downloads/old stuff", "Downloads"], None)
+        ws.undo_move("docs/a.txt", "Downloads/old stuff/a.txt", removed)
+        assert (root / "Downloads" / "old stuff" / "a.txt").exists()
+
+    def test_remove_emptied_directories_stops_at_one_that_is_not_empty(self, ws: Workspace, root: Path):
+        (root / "Downloads" / "old stuff").mkdir(parents=True)
+        (root / "Downloads" / "new.txt").write_text("appeared meanwhile")
+        removed, problem = ws.remove_emptied_directories(["Downloads/old stuff", "Downloads"])
+        assert removed == ["Downloads/old stuff"]
+        assert problem == "kept 'Downloads': it is not an empty directory"
+        assert (root / "Downloads" / "new.txt").exists()
+
+    def test_remove_emptied_directories_keeps_what_it_removed_when_a_path_is_unsafe(
+            self, ws: Workspace, root: Path):
+        (root / "Downloads" / "old stuff").mkdir(parents=True)
+        removed, problem = ws.remove_emptied_directories(["Downloads/old stuff", "../outside"])
+        assert removed == ["Downloads/old stuff"]
+        assert problem is not None and problem.startswith("could not remove '../outside': ")
+
+    def test_undo_move_recreates_only_removed_directories(self, ws: Workspace, root: Path):
+        (root / "gone").mkdir()
+        (root / "gone" / "a.txt").write_text("a")
+        ws.move_file_change("gone/a.txt", "docs")
+        (root / "gone").rmdir()
+        with pytest.raises(WorkspaceError, match="no longer exists"):
+            ws.undo_move("docs/a.txt", "gone/a.txt")
+        assert not (root / "gone").exists()
+
     def test_remove_empty_directory_only_when_empty(self, ws: Workspace, root: Path):
         (root / "empty").mkdir()
         (root / "hidden").mkdir()

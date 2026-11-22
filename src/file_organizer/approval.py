@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 class Decision(TypedDict):
@@ -10,6 +10,9 @@ class Decision(TypedDict):
 
     approved: bool
     feedback: str | None
+    # move_file only: the directories the move leaves empty, shown to the human with
+    # the move; approving the move approves removing exactly these (deepest first).
+    remove_dirs: NotRequired[list[str]]
 
 
 def _safe(value: Any, limit: int = 200) -> str:

@@ -60,14 +60,19 @@ def check() -> int:
         where = actual or "(top level)"
         shown = ", ".join(a or "(top level)" for a in allowed)
         if actual in allowed:
-            print(f"  ok       {name:28} -> {where}")
+            print(f"  ok       {name:36} -> {where}")
             ok += 1
         else:
-            print(f"  WRONG    {name:28} -> {where}   (expected: {shown})")
+            print(f"  WRONG    {name:36} -> {where}   (expected: {shown})")
             bad += 1
     for extra, where in found.items():
-        print(f"  EXTRA    {extra:28} -> {where or '(top level)'}")
+        print(f"  EXTRA    {extra:36} -> {where or '(top level)'}")
         bad += 1
+    # Only category directories should remain: no emptied leftovers like Downloads/.
+    for d in sorted(p for p in INBOX.rglob("*") if p.is_dir()):
+        if not any(f.is_file() and not f.name.startswith(".") for f in d.rglob("*")):
+            print(f"  LEFTOVER {d.relative_to(INBOX).as_posix()}/ (empty directory)")
+            bad += 1
 
     print(f"\n{ok} ok, {bad} problem(s)")
     return 0 if bad == 0 else 1

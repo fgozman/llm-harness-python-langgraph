@@ -30,8 +30,10 @@ phoenix = [
     "openinference-instrumentation-langchain>=0.1.89",
 ]
 documents = [
+    "olefile>=0.47",
     "pillow>=11",
     "pypdf>=5",
+    "xlrd>=2.0.1",
 ]
 
 [build-system]
@@ -55,8 +57,10 @@ src = ["src", "tests"]
 
 [dependency-groups]
 dev = [
+    "olefile>=0.47",
     "pillow>=11",
     "pypdf>=5",
     "pytest>=9.2.0",
     "ruff>=0.17.6,<0.18",
+    "xlrd>=2.0.1",
 ]

@@ -291,11 +291,86 @@ def test_rename_on_clash_counts_earlier_moves_of_the_batch(folder: Path, first_a
         ai(content="ok"),
     )
     first = interrupts(start(graph))[0]
-    assert first["description"] == "Move 'a/report.txt' -> 'finance'"
+    emptied = " (then removes the emptied directory '{}')"
+    assert first["description"] == "Move 'a/report.txt' -> 'finance'" + emptied.format("a")
     second = interrupts(graph.invoke(Command(resume=first_answer), CONFIG))[0]
-    assert second["description"] == "Move 'b/report.txt' -> 'finance'" + expected_note
+    assert second["description"] == "Move 'b/report.txt' -> 'finance'" + expected_note + emptied.format("b")
     graph.invoke(Command(resume=True), CONFIG)
     if first_answer:
         assert (folder / "finance" / "report (2).txt").read_text() == "report b"
     else:
         assert (folder / "finance" / "report.txt").read_text() == "report b"
+
+
+def _downloads(folder: Path) -> None:
+    (folder / "docs").mkdir()
+    (folder / "Downloads" / "old stuff").mkdir(parents=True)
+    (folder / "Downloads" / "old stuff" / "a.txt").write_text("a")
+    (folder / "Downloads" / "b.txt").write_text("b")
+
+
+def _empty_downloads_batch():
+    return ai(call("move_file", source="Downloads/old stuff/a.txt", destination="docs"),
+              call("move_file", source="Downloads/b.txt", destination="docs"))
+
+
+def test_directories_a_move_empties_are_shown_and_removed_only_when_approved(folder: Path):
+    _downloads(folder)
+    graph, _ = make(Workspace(folder), _empty_downloads_batch(), ai(content="ok"))
+    first = interrupts(start(graph))[0]
+    old = " (then removes the emptied directory 'Downloads/old stuff')"
+    both = " (then removes the emptied directory 'Downloads')"
+    # The plan assumes all are approved; each question counts the earlier answers.
+    assert [i["description"] for i in first["batch"]] == [
+        "Move 'Downloads/old stuff/a.txt' -> 'docs'" + old, "Move 'Downloads/b.txt' -> 'docs'" + both]
+    assert first["description"] == first["batch"][0]["description"]
+    second = interrupts(graph.invoke(Command(resume=True), CONFIG))[0]
+    assert second["description"] == first["batch"][1]["description"]
+    result = graph.invoke(Command(resume=True), CONFIG)
+    assert not (folder / "Downloads").exists()
+    moved = tool_messages(result)
+    assert "Removed the now-empty directory 'Downloads/old stuff'." in moved[0].content
+    assert moved[0].artifact["removed"] == ["Downloads/old stuff"]
+    assert moved[1].artifact["removed"] == ["Downloads"]
+
+
+def test_moving_into_an_ancestor_removes_only_the_emptied_subdirectory(folder: Path):
+    (folder / "work" / "old").mkdir(parents=True)
+    (folder / "work" / "old" / "a.txt").write_text("a")
+    graph, _ = make(Workspace(folder), ai(call("move_file", source="work/old/a.txt", destination="work")),
+                    ai(content="ok"))
+    question = interrupts(start(graph))[0]
+    assert question["description"] == (
+        "Move 'work/old/a.txt' -> 'work' (then removes the emptied directory 'work/old')")
+    result = graph.invoke(Command(resume=True), CONFIG)
+    assert (folder / "work" / "a.txt").exists() and not (folder / "work" / "old").exists()
+    assert "cleanup stopped" not in tool_messages(result)[0].content
+
+
+def test_rejected_move_keeps_its_directory_and_its_parents(folder: Path):
+    _downloads(folder)
+    graph, _ = make(Workspace(folder), _empty_downloads_batch(), ai(content="ok"))
+    start(graph)
+    second = interrupts(graph.invoke(Command(resume=False), CONFIG))[0]
+    # a.txt stays, so moving b.txt no longer empties Downloads/.
+    assert second["description"] == "Move 'Downloads/b.txt' -> 'docs'"
+    graph.invoke(Command(resume=True), CONFIG)
+    assert (folder / "Downloads" / "old stuff" / "a.txt").exists()
+
+
+def test_failed_directory_removal_is_reported_to_the_model(folder: Path, monkeypatch):
+    _downloads(folder)
+    graph, _ = make(Workspace(folder), _empty_downloads_batch(), ai(content="ok"))
+    start(graph)
+    graph.invoke(Command(resume=True), CONFIG)
+
+    def no_permission(self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "rmdir", no_permission)
+    result = graph.invoke(Command(resume=True), CONFIG)
+    moved = tool_messages(result)
+    assert "could not remove 'Downloads/old stuff': Permission denied" in moved[0].content
+    assert "removed" not in moved[0].artifact
+    assert (folder / "docs" / "b.txt").exists()  # the moves themselves still happened
+    assert "kept 'Downloads': it is not an empty directory" in moved[1].content  # old stuff/ remains

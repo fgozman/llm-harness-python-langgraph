@@ -73,6 +73,47 @@ def make_docx(paragraphs: list[str], prolog: str = "") -> bytes:
     return buf.getvalue()
 
 
+def make_xlsx(sheets: dict[str, list[list[object]]], date1904: bool = False) -> bytes:
+    """A minimal .xlsx. Cells: str -> shared string, ("inline", s) -> inline string,
+    ("date", serial) / ("elapsed", serial) -> number with a date / [h]:mm format, else a number."""
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' \
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    shared: list[str] = []
+    styles = {"date": 1, "elapsed": 2}
+
+    def cell(ref: str, value: object) -> str:
+        if isinstance(value, str):
+            shared.append(value)
+            return f'<c r="{ref}" t="s"><v>{len(shared) - 1}</v></c>'
+        if isinstance(value, tuple) and value[0] == "inline":
+            return f'<c r="{ref}" t="inlineStr"><is><t>{value[1]}</t></is></c>'
+        if isinstance(value, tuple):
+            return f'<c r="{ref}" s="{styles[value[0]]}"><v>{value[1]}</v></c>'
+        return f'<c r="{ref}"><v>{value}</v></c>'
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        entries, rels = [], []
+        for i, (name, rows) in enumerate(sheets.items(), start=1):
+            xml_rows = "".join(
+                f'<row r="{r}">' + "".join(cell(f"{chr(65 + c)}{r}", v) for c, v in enumerate(row) if v is not None)
+                + "</row>" for r, row in enumerate(rows, start=1))
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", f"<worksheet {ns}><sheetData>{xml_rows}</sheetData></worksheet>")
+            entries.append(f'<sheet name="{name}" sheetId="{i}" r:id="rId{i}"/>')
+            rels.append(f'<Relationship Id="rId{i}" Target="worksheets/sheet{i}.xml" Type="worksheet"/>')
+        pr = '<workbookPr date1904="1"/>' if date1904 else ""
+        zf.writestr("xl/workbook.xml", f"<workbook {ns}>{pr}<sheets>{''.join(entries)}</sheets></workbook>")
+        zf.writestr("xl/_rels/workbook.xml.rels",
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    + "".join(rels) + "</Relationships>")
+        sis = "".join(f"<si><t>{s}</t></si>" for s in shared)
+        zf.writestr("xl/sharedStrings.xml", f"<sst {ns}>{sis}</sst>")
+        zf.writestr("xl/styles.xml", f'<styleSheet {ns}><numFmts><numFmt numFmtId="164" formatCode="[h]:mm"/>'
+                    '</numFmts><cellStyleXfs><xf numFmtId="14"/></cellStyleXfs><cellXfs><xf numFmtId="0"/>'
+                    '<xf numFmtId="14"/><xf numFmtId="164"/></cellXfs></styleSheet>')
+    return buf.getvalue()
+
+
 def make_jpeg_with_exif() -> bytes:
     from PIL import Image
 
@@ -309,6 +350,13 @@ class TestDocuments:
         out = ws.read_file("bomb.docx")
         assert "not available" in out and "DTD" in out
 
+    def test_truncated_docx_gives_metadata_and_a_reason(self, ws: Workspace, root: Path):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("word/document.xml", '<w:document xmlns:w="x"><w:body><w:p><w:t>cut')
+        put(root, "cut.docx", buf.getvalue())
+        assert "could not parse the DOCX" in ws.read_file("cut.docx")
+
     def test_corrupt_pdf_gives_metadata_and_a_reason(self, ws: Workspace, root: Path):
         put(root, "broken.pdf", b"%PDF-1.4\ngarbage")
         out = ws.read_file("broken.pdf")
@@ -326,6 +374,68 @@ class TestDocuments:
         assert "size:" in out and "documents' extra" in out and "hello" not in out
 
 
+class TestSpreadsheets:
+    def test_xlsx_header_and_first_rows_of_each_sheet(self, ws: Workspace, root: Path):
+        rows = [["date", "payee", "amount"]] + [[("date", 45294 + i), f"Shop {i}", 10.5 + i] for i in range(20)]
+        put(root, "bank.xlsx", make_xlsx({"2024": rows, "Notes": [[("inline", "keep for taxes")]], "Empty": []}))
+        out = ws.read_file("bank.xlsx")
+        assert metadata(out)["mime type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert "sheets: 3 ('2024', 'Notes', 'Empty')" in out
+        assert content(out).splitlines() == [
+            "[sheet '2024']", "date,payee,amount",
+            "2024-01-03,Shop 0,10.5", "2024-01-04,Shop 1,11.5", "2024-01-05,Shop 2,12.5",
+            "2024-01-06,Shop 3,13.5", "2024-01-07,Shop 4,14.5", "[... more rows]",
+            "[sheet 'Notes']", "keep for taxes",
+            "[sheet 'Empty']", "(empty)",
+        ]
+
+    def test_xlsx_gaps_durations_and_the_1904_date_system(self, ws: Workspace, root: Path):
+        put(root, "t.xlsx", make_xlsx({"S": [["a", None, "c"], [("date", 1), ("elapsed", 1.5), 7]]}, date1904=True))
+        assert content(ws.read_file("t.xlsx")).splitlines()[1:] == ["a,,c", "1904-01-02,36:00:00,7"]
+
+    def test_xlsx_misnamed_is_still_read(self, ws: Workspace, root: Path):
+        put(root, "data.bin", make_xlsx({"S": [["invoice total", 99]]}))
+        assert "invoice total,99" in ws.read_file("data.bin")
+
+    def test_corrupt_xlsx_gives_metadata_and_a_reason(self, ws: Workspace, root: Path):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("xl/workbook.xml", "<workbook><sheets>")  # truncated XML
+        put(root, "bad.xlsx", buf.getvalue())
+        assert "could not parse the XLSX" in ws.read_file("bad.xlsx")
+
+    @pytest.mark.parametrize(("name", "mime"), [("old.doc", "application/msword"),
+                                                ("old.xls", "application/vnd.ms-excel")])
+    def test_legacy_office_files_are_recognised(self, ws: Workspace, root: Path, name: str, mime: str):
+        put(root, name, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 512)  # OLE2 magic, no content
+        out = ws.read_file(name)  # (real .doc/.xls files: tests/test_legacy_office.py)
+        assert metadata(out)["mime type"] == mime and "legacy Office file" in out
+
+    @pytest.mark.parametrize(("code", "kind"), [
+        ("dd/mm/yyyy", "date"), ("mmm-yy", "date"), ("hh:mm", "date"), ("[h]:mm:ss", "elapsed"),
+        ("0.00", None), ("General", None), ('"Day "0', None), ("[Red]#,##0", None), ("0 \\d", None),
+    ])
+    def test_date_format_detection(self, code: str, kind: str | None):
+        assert extract._date_format_kind(code) == kind
+
+    @pytest.mark.parametrize(("serial", "text"), [
+        ("1", "1900-01-01"), ("59", "1900-02-28"), ("61", "1900-03-01"),  # Excel's 1900-02-29 bug
+        ("45294", "2024-01-03"), ("45294.75", "2024-01-03 18:00:00"), ("0.5", "12:00:00"), ("x", None),
+        ("2958465.999999", None),  # rounds past datetime.max
+
+    ])
+    def test_excel_dates(self, serial: str, text: str | None):
+        assert extract._excel_date(serial, date1904=False) == text
+
+    def test_time_of_day_in_the_1904_date_system(self):
+        assert extract._excel_date("0.5", date1904=True) == "12:00:00"  # like .xls via xlrd
+
+    def test_oversized_xlsx_part_gives_metadata_and_a_reason(self, ws: Workspace, root: Path, monkeypatch):
+        monkeypatch.setattr(extract, "MAX_DOCX_XML_BYTES", 100)
+        put(root, "big.xlsx", make_xlsx({"S": [[f"cell {i}" for i in range(20)]]}))
+        assert "larger than 100 bytes" in ws.read_file("big.xlsx")
+
+
 class TestImages:
     def test_exif_is_reported(self, ws: Workspace, root: Path):
         put(root, "IMG_0001.jpg", make_jpeg_with_exif())
@@ -334,6 +444,19 @@ class TestImages:
         assert "image: JPEG, 4x3 pixels" in out
         for line in ("exif Make: Canon", "exif Model: EOS 5D", "exif DateTime: 2023:08:14 10:00:00"):
             assert line in out
+
+    @pytest.mark.parametrize(("tags", "expected"), [
+        ({"GPSLatitude": (38, 41, 29.16), "GPSLatitudeRef": "N",
+          "GPSLongitude": (9, 12, 35.88), "GPSLongitudeRef": "W"}, (38.69143, -9.20997)),
+        ({"GPSLatitude": (33, 52, 4.0), "GPSLatitudeRef": "S",
+          "GPSLongitude": (151, 12, 26.0), "GPSLongitudeRef": "E"}, (-33.86778, 151.20722)),
+        ({"GPSLatitude": (38, 41, 29.16)}, None),  # no longitude
+        ({"GPSLatitude": "garbage", "GPSLongitude": (1, 2, 3)}, None),
+        ({"GPSLatitude": (95, 0, 0), "GPSLongitude": (1, 0, 0)}, None),  # out of range
+    ])
+    def test_gps_as_decimal_degrees(self, tags: dict, expected):
+        position = extract._gps_decimal(tags)
+        assert (position and tuple(round(v, 5) for v in position)) == expected
 
     def test_missing_pillow_falls_back_to_metadata(self, ws: Workspace, root: Path, monkeypatch):
         put(root, "p.jpg", make_jpeg_with_exif())

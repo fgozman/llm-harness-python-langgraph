@@ -8,7 +8,7 @@ and **every change to the filesystem is approved by a human first**.
 ## Quick start
 
 ```bash
-uv sync --extra anthropic          # or: --extra openai; add --extra documents for PDF text and image EXIF
+uv sync --extra anthropic          # or: --extra openai; add --extra documents for PDF, .doc, .ppt and .xls text and image EXIF
 # put your API key (and optionally the model) in .env, see .env.example
 uv run file-organizer ~/Downloads/inbox
 uv run file-organizer ~/Downloads/inbox --model openai:gpt-4.1   # any init_chat_model id
@@ -139,8 +139,8 @@ uv run file-organizer ~/Downloads/inbox --undo
 
 Every applied change is recorded in the decision log together with how to reverse it.
 `--undo` shows the whole plan (newest change first), asks once, and then moves each file
-back to where it was and removes the directories the session created, if they are empty
-again. It never overwrites: a step that conflicts (the original name is taken again, the
+back to where it was (recreating the directories its move removed) and removes the
+directories the session created, if they are empty again. It never overwrites: a step that conflicts (the original name is taken again, the
 file was moved or deleted since, a new directory now holds other files) is skipped and
 reported, and running `--undo` again retries just those steps. Undone changes are
 removed from the log, so a second undo does nothing. An interrupted session of the folder
@@ -306,8 +306,11 @@ uv run file-organizer demo/inbox
 uv run python demo/demo.py check      # compare the result with demo/expected.json
 ```
 
-The 14 sample files include tricky cases: misleading names, a binary file, a long
-(truncated) file, an existing `finance/` folder, a hidden file, and an ambiguous file (which the agent should move to `unsorted/`).
+The 26 sample files cover every format `read_file` understands (text, CSV, PDF, DOCX, DOC,
+XLSX, XLS, PPT, images with EXIF) and tricky cases: misleading names, a long file whose key
+facts sit in the middle, an existing `finance/` folder, a non-category `Downloads/` folder
+(with a nested `old stuff/`) whose files must be sorted too, a hidden file, and an ambiguous
+file (which the agent should move to `unsorted/`).
 See [`demo/README.md`](demo/README.md).
 
 ## Architecture
@@ -321,10 +324,10 @@ START → summarize → agent ──(no tool calls)──▶ END
 
 | Module | Responsibility |
 |---|---|
-| `workspace.py` | Filesystem operations sandboxed to the target folder. It rejects `..`, absolute paths, and symlink escapes. It moves files only into existing directories and never overwrites; it renames only with `rename_on_clash` (to a free `name (2).ext`). Each change reports how to undo it (`Change.undo`), and `undo_move()`/`remove_empty_directory()` reverse it. `read_file` returns metadata first (name, extension, MIME type, size, mtime), then content by format, detected from the file's first bytes: text, PDF/DOCX text, a CSV's header and first 5 rows, image EXIF; other binary files get metadata only. Long text shows ~2K characters each from its beginning, middle and end, with truncation markers between them; `offset`/`limit` page through the rest. Reads are bounded (`max_read_chars` per call, `max_parse_bytes` per document or paging scan). |
-| `extract.py` | Format detection and the bounded extractors used by `read_file`. DOCX uses the standard library (DTDs refused, zip-bomb cap). PDF (`pypdf`) and EXIF (`pillow`) come from the optional `documents` extra; without it those files get metadata and a hint. |
+| `workspace.py` | Filesystem operations sandboxed to the target folder. It rejects `..`, absolute paths, and symlink escapes. It moves files only into existing directories and never overwrites; it renames only with `rename_on_clash` (to a free `name (2).ext`). Each change reports how to undo it (`Change.undo`), and `undo_move()`/`remove_empty_directory()` reverse it. `read_file` returns metadata first (name, extension, MIME type, size, mtime), then content by format, detected from the file's first bytes: text, PDF/DOCX/DOC text, PPT slide text with speaker notes, the header and first 5 rows of a CSV or of each XLSX/XLS sheet, image EXIF, and the summary information (title, author) of legacy Office files; other binary files get metadata only. Long text shows ~2K characters each from its beginning, middle and end, with truncation markers between them; `offset`/`limit` page through the rest. Reads are bounded (`max_read_chars` per call, `max_parse_bytes` per document or paging scan). |
+| `extract.py` | Format detection and the bounded extractors used by `read_file`. DOCX and XLSX use the standard library (DTDs refused, zip-bomb cap; XLSX reads only the rows it shows). Legacy files are opened with `olefile`: `.doc` (Word 6-2003) text comes from its piece table, `.ppt` (PowerPoint 95-2003) text slide by slide via the persist directory of the last save, and `.xls` previews use `xlrd`. PDF (`pypdf`), EXIF (`pillow`), `.doc`, `.ppt` and `.xls` need the optional `documents` extra; without it those files get metadata and a hint. |
 | `tools.py` | Wraps the workspace as LangChain tools; each function's docstring becomes the tool description. `WorkspaceError` is a `ToolException`, so errors are sent back to the model as `Error: …` tool results. `read_file` wraps content in tags with a random id per read (`wrap_file_content`). The changing tools return their undo information as the ToolMessage's `artifact`, which the model never sees. `MUTATING_TOOLS = {create_directory, move_file}`. |
-| `graph.py` | The LangGraph `StateGraph` (state schema, nodes, wiring), compiled with a checkpointer (required) and a store. `summarize` shrinks the history when needed. `agent` calls the LLM with the decision log in the system prompt and a trimmed request. `review` calls `interrupt()` once for each mutating tool call (each payload also lists the whole batch, for the plan) and does nothing else, so LangGraph can safely re-run it on resume. `tools` runs read-only calls and approved changes; for rejected changes it returns a `Rejected by the user …` message, including any feedback. It then writes the final decisions, with their undo information, to the store. |
+| `graph.py` | The LangGraph `StateGraph` (state schema, nodes, wiring), compiled with a checkpointer (required) and a store. `summarize` shrinks the history when needed. `agent` calls the LLM with the decision log in the system prompt and a trimmed request. `review` calls `interrupt()` once for each mutating tool call (each payload also lists the whole batch, for the plan, and for a move the directories it will leave empty) and does nothing else, so LangGraph can safely re-run it on resume. `tools` runs read-only calls and approved changes; after an approved move it removes exactly the emptied directories approved with it; for rejected changes it returns a `Rejected by the user …` message, including any feedback. It then writes the final decisions, with their undo information, to the store. |
 | `memory.py` | Context management: `ContextPolicy` (limits), the summarize node (wrapping `SummarizationMiddleware`), `fit_context()` (trimming safety net), and `DecisionLog` (finalized decisions in the store). |
 | `persistence.py` | `sqlite_checkpointer()` (`PruningSqliteSaver`: `SqliteSaver` + `prune(keep_latest/delete)`) and `sqlite_store()` (`SqliteStore` with a TTL), both in one SQLite file. |
 | `approval.py` | The `Decision` type, parsing of resume values, and escaped descriptions of proposed changes. |
@@ -336,7 +339,11 @@ START → summarize → agent ──(no tool calls)──▶ END
 | `log.py` | Logging configuration (`dictConfig`): queue handler, background thread, rotating file, UTC timestamps, text or JSON-lines format, `run_id`/`thread_id` (and `trace_id` while tracing) on every record. `configure_logging()` returns a `stop()` function that flushes the log. |
 
 Safety properties (all covered by tests):
-- Nothing is written to disk before approval. Only an explicit `True` or `{"approved": True}` approves a change; any other resume value counts as a rejection.
+- Nothing is written to disk before approval. A move that leaves its source directory
+  empty (say the last file in `Downloads/`) also removes that directory, and any parent it
+  empties, but only the ones named in the approval question (`... (then removes the emptied
+  directory 'Downloads')`); the batch plan names them too. If one can't be removed after
+  the move (no permission, or a file appeared meanwhile), the tool result says so. Only an explicit `True` or `{"approved": True}` approves a change; any other resume value counts as a rejection.
 - Every change in a batch of parallel tool calls is approved separately, and approved changes run only once.
 - The agent can't touch anything outside the target folder, nor hidden files (`.env`, `.git/`, its own state/log files) or symlinks inside it.
 - Bad paths (null bytes, overlong) and malformed tool arguments are returned to the model as errors instead of crashing the run.
@@ -381,7 +388,8 @@ between minor versions; its settings are under `[tool.ruff]` in `pyproject.toml`
 The tests use a scripted fake chat model (`tests/conftest.py`), so they're deterministic
 and don't call any LLM. They cover:
 - `test_workspace.py`: sandbox and filesystem semantics
-- `test_read_file.py`: `read_file` metadata, per-format extraction (PDF, DOCX, CSV, EXIF, binary), head/tail truncation, `offset`/`limit` paging, the byte caps, and the fallbacks for missing libraries or corrupt files
+- `test_legacy_office.py`: `.doc` (Word 97 and Word 6/95, incl. fast-saved files and code pages), `.xls`, and `.ppt` (slide order, notes, masters and stale saves skipped, damaged files, PowerPoint 95), using LibreOffice-made fixtures (`tests/fixtures/office`) and a small in-test OLE2 writer for formats LibreOffice can't write
+- `test_read_file.py`: `read_file` metadata, per-format extraction (PDF, DOCX, XLSX, CSV, EXIF, binary), head/tail truncation, `offset`/`limit` paging, the byte caps, and the fallbacks for missing libraries or corrupt files
 - `test_tools.py`: the tool surface and error handling
 - `test_graph.py`: the agent loop, interrupts, approval and rejection, batches, a full session, the required checkpointer, and reopening the SQLite file. Graph tests use the real `SqliteSaver` on an in-memory SQLite database.
 - `test_cli.py`: prompt parsing, the batch plan and "approve all remaining", a full interactive session, Ctrl-C, the entry point, and the `--recursion-limit`/`--rename-on-clash` options

@@ -116,11 +116,11 @@ def test_undo_stopped_half_way_can_be_retried(folder: Path, state_db: Path, monk
     real_undo_move = Workspace.undo_move
     calls = []
 
-    def flaky_undo_move(self, moved_to, original):
+    def flaky_undo_move(self, moved_to, original, removed=()):
         calls.append(moved_to)
         if len(calls) == 2:
             raise error
-        return real_undo_move(self, moved_to, original)
+        return real_undo_move(self, moved_to, original, removed)
 
     monkeypatch.setattr(Workspace, "undo_move", flaky_undo_move)
     if error is KeyboardInterrupt:

@@ -34,13 +34,19 @@ MAX_DIRECTORY_DEPTH = 3  # how deep create_directory may nest category folders
 MAX_PATH_CHARS = 1_024
 MAX_RENAME_ATTEMPTS = 1_000  # "name (2).txt" ... "name (1000).txt"
 
+_DOCUMENT_EXTRACTORS = {"pdf": extract.pdf_text, "docx": extract.docx_text, "xlsx": extract.xlsx_preview,
+                        "ole": extract.legacy_office}
+
 
 class Change(NamedTuple):
     """The result of a filesystem change: the message for the model, and how to undo it.
 
     ``undo`` is JSON-serializable (it is kept in the decision log) or None when nothing
     changed on disk (e.g. the directory already existed):
-    * ``{"op": "move", "from": "a.txt", "to": "finance/a.txt"}``
+    * ``{"op": "move", "from": "a.txt", "to": "finance/a.txt"}``, plus
+      ``"removed": ["Downloads/old", "Downloads"]`` (deepest first) when the approved
+      emptied directories were removed after it (added by the graph's tools node, see
+      ``remove_emptied_directories``)
     * ``{"op": "mkdir", "paths": ["docs", "docs/finance"]}`` (every directory created,
       parents first)
     """
@@ -181,17 +187,18 @@ class Workspace:
             if page:
                 lines.append("[offset/limit ignored: an image has no text to page through]")
             return "[content: image metadata]\n" + "\n".join(lines)
-        if kind in ("pdf", "docx"):
+        if kind in _DOCUMENT_EXTRACTORS:
             if size > self.max_parse_bytes:
                 raise extract.ExtractionError(
                     f"the document is larger than {self.max_parse_bytes} bytes, so it was not parsed")
-            extractor = extract.pdf_text if kind == "pdf" else extract.docx_text
-            text, details, cut = extractor(target, MAX_EXTRACT_CHARS)
-            label = f"{kind.upper()} text" + (f" (extraction stopped after {len(text)} characters)" if cut else "")
-            prefix = "".join(line + "\n" for line in details)
-            if not text.strip():
-                return prefix + f"[content: {kind.upper()} has no extractable text (e.g. a scan)]"
-            return prefix + self._view(text, page, label)
+            result = _DOCUMENT_EXTRACTORS[kind](target, MAX_EXTRACT_CHARS)
+            prefix = "".join(line + "\n" for line in result.details)
+            if not result.text.strip():
+                return prefix + f"[content: none - {result.label}: {result.empty}; classify the file by its metadata]"
+            label = result.label
+            if result.truncated:
+                label += f" (extraction stopped after {len(result.text)} characters)"
+            return prefix + self._view(result.text, page, label)
         if kind == "csv" and page is None:
             return self._csv_preview(target, size)
         return self._text(target, size, page)
@@ -360,9 +367,54 @@ class Workspace:
             message += f" A file named '{src.name}' was already there, so it was renamed to '{dst.name}'."
         return Change(message, {"op": "move", "from": src_rel, "to": self._rel(dst)})
 
+    def emptied_directories(self, source: str, gone: Collection[str] = (),
+                            claimed: Collection[str] = ()) -> list[str]:
+        """The directories (deepest first, never the root) that moving ``source`` away
+        would leave empty (hidden files count). ``gone``: files and directories that
+        earlier moves of the same batch will have taken away; ``claimed``: files those
+        moves will have put somewhere. Changes nothing: the human approves the removal
+        together with the move."""
+        src = self._resolve(source)
+        away = {self._resolve(p) for p in gone} | {src}
+        incoming = [self._resolve(p) for p in claimed]
+        emptied: list[str] = []
+        directory = src.parent
+        while directory != self.root and self.root in directory.parents:
+            if any(directory in p.parents for p in incoming):
+                break
+            if any(child not in away for child in directory.iterdir()):
+                break
+            emptied.append(self._rel(directory))
+            away.add(directory)
+            directory = directory.parent
+        return emptied
+
+    def remove_emptied_directories(self, paths: Collection[str]) -> tuple[list[str], str | None]:
+        """Remove the approved, now-empty ``paths`` (deepest first). Stops at the first one
+        that can't be removed (its parents then can't be empty either).
+        Returns (removed directories, why the rest was kept or None). Never raises: the
+        move already happened, so what was removed must reach its undo record."""
+        removed: list[str] = []
+        for path in paths:
+            try:
+                target = self._resolve(path)
+            except WorkspaceError as exc:  # e.g. the path turned into a symlink meanwhile
+                return removed, f"could not remove '{path}': {exc}"
+            if not target.is_dir() or any(target.iterdir()):
+                return removed, f"kept '{self._rel(target)}': it is not an empty directory"
+            try:
+                target.rmdir()
+            except OSError as exc:  # e.g. no permission; the move itself already happened
+                return removed, f"could not remove '{self._rel(target)}': {exc.strerror or exc}"
+            log.info("Removed emptied directory %s", target)
+            removed.append(self._rel(target))
+        return removed, None
+
     # -------------------------------------------------------------------- undo
-    def undo_move(self, moved_to: str, original: str) -> str:
-        """Move a file back to where it was before ``move_file``. Never overwrites."""
+    def undo_move(self, moved_to: str, original: str, removed: Collection[str] = ()) -> str:
+        """Move a file back to where it was before ``move_file``. Never overwrites.
+        ``removed``: directories the move removed because they became empty; they are
+        created again if missing (no other missing directory is)."""
         current = self._resolve(moved_to)
         back = self._resolve(original)
         if not current.is_file():
@@ -370,7 +422,13 @@ class Workspace:
         if back.exists() or back.is_symlink():
             raise WorkspaceError(f"'{original}' exists again; refusing to overwrite it.")
         if not back.parent.is_dir():
-            raise WorkspaceError(f"The original directory of '{original}' no longer exists.")
+            allowed = {self._rel(self._resolve(d)) for d in removed}
+            missing = [p for p in (back.parent, *back.parent.parents)
+                       if self.root in p.parents and not p.exists()]
+            if not missing or any(self._rel(p) not in allowed for p in missing):
+                raise WorkspaceError(f"The original directory of '{original}' no longer exists.")
+            back.parent.mkdir(parents=True)
+            log.info("Undo: recreated directory %s", back.parent)
         shutil.move(current, back)
         log.info("Undo: moved %s back to %s", current, back)
         return f"Moved '{self._rel(current)}' back to '{self._rel(back)}'."
